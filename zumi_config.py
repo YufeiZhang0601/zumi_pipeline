@@ -42,10 +42,12 @@ class HttpNodeConfig:
 
 @dataclass
 class MotorConfig:
-    DRIVER: str = "dm"  # "dm" or "mock"
+    DRIVER: str = "dm"
     SLAVE_ID: int = 0x16
     MASTER_ID: int = 0x26
     SERIAL_PORT: str = "/dev/dm_can0"
+    TARGET_FREQ: float = 150.0  # Motor control loop frequency (Hz)
+    LOCK_DURATION: float = 0.5  # Lock gripper position for first N seconds (0 = no lock)
 
 
 @dataclass

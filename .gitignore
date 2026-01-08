@@ -32,6 +32,6 @@ Thumbs.db
 data/*
 *.MP4
 *.mp4
-*.json
 .env
 debug_data/*
+.workflow/*

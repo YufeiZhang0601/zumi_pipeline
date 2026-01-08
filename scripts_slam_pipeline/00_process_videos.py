@@ -69,6 +69,16 @@ def get_gripper_prefix(gopro_filename):
         return match.group(1)
     return None
 
+
+def is_gopro_video(filename):
+    """Check if filename matches GoPro naming pattern (whitelist).
+
+    GoPro files end with _GX{6digits} or _GL{6digits} (for .LRV low-res proxy).
+    Example: 'run_20260107T161428Z_ep001_gp00_GX011810' -> True
+             'run_20260107T161428Z_ep001_gp00_uvc' -> False
+    """
+    return bool(re.search(r'_G[XL]\d{6}$', filename))
+
 # %%
 @click.command(help='Session directories. Assumming mp4 videos are in <session_dir>/raw_videos')
 @click.argument('session_dir', nargs=-1)
@@ -89,13 +99,14 @@ def main(session_dir):
             input_dir.mkdir()
             print(f"{input_dir.name} subdir don't exits! Creating one and moving all mp4 videos inside.")
             for mp4_path in list(session.glob('**/*.MP4')) + list(session.glob('**/*.mp4')):
+                # 只移动 GoPro 视频，其他视频和 jsonl 一起在后面处理
+                if not is_gopro_video(mp4_path.stem):
+                    continue
                 out_path = input_dir.joinpath(mp4_path.name)
                 shutil.move(mp4_path, out_path)
 
         # create MP4 name map to imu json name
         mp4_name_to_imu_json_name = dict()
-        mp4_name_to_motor_data_path = dict()
-        mp4_name_to_motor_meta_data_path = dict()
         gripper_prefix_to_motor_data_path = dict()
         gripper_prefix_to_uvc_video_path = dict()
         gripper_prefix_to_uvc_data_path = dict()
@@ -107,6 +118,10 @@ def main(session_dir):
 
             # 跳过 mapping 文件
             if name_without_ext.startswith('mapping'):
+                continue
+
+            # 只处理 GoPro 视频（白名单：_GX{6digits}）
+            if not is_gopro_video(name_without_ext):
                 continue
 
             # 解析文件名格式
@@ -147,18 +162,15 @@ def main(session_dir):
                 elif uvc_video_path.exists() or uvc_data_path.exists():
                     print(f"Warning: UVC files incomplete for {gripper_prefix}. Need both video and timestamps.")
 
-            # 记录每个 gripper 的第一个视频（按时间）
-            if gripper_str:
-                start_date = mp4_get_start_datetime(str(mp4_path))
-                if gripper_str not in gripper_id_first_video or start_date < gripper_id_first_video[gripper_str][0]:
-                    gripper_id_first_video[gripper_str] = (start_date, mp4_path)
-
         # create mapping video if don't exist
         mapping_vid_path = input_dir.joinpath('mapping.mp4')
         if (not mapping_vid_path.exists()) and not(mapping_vid_path.is_symlink()):
             max_size = -1
             max_path = None
             for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
+                # 只处理 GoPro 视频（白名单：_GX{6digits}）
+                if not is_gopro_video(mp4_path.stem):
+                    continue
                 size = mp4_path.stat().st_size
                 if size > max_size:
                     max_size = size
@@ -166,16 +178,39 @@ def main(session_dir):
 
             print(f"max_path: {max_path}, mapping_vid_path: {mapping_vid_path}")
             shutil.move(max_path, mapping_vid_path)
+
+            # 移动 IMU 数据（使用完整文件名作为 key）
             imu_json_path = mp4_name_to_imu_json_name.get(max_path.with_suffix('').name, None)
             if imu_json_path is not None:
                 shutil.move(imu_json_path, input_dir.joinpath('mapping_imu.json'))
-            motor_data_path = mp4_name_to_motor_data_path.get(max_path.with_suffix('').name, None)
-            if motor_data_path is not None:
-                shutil.move(motor_data_path, input_dir.joinpath('mapping_motor.npz'))
-            motor_meta_data_path = mp4_name_to_motor_meta_data_path.get(max_path.with_suffix('').name, None)
-            if motor_meta_data_path is not None:
-                shutil.move(motor_meta_data_path, input_dir.joinpath('mapping_motor_meta.json'))
+
+            # 移动 motor 和 UVC 数据（使用 gripper_prefix 作为 key）
+            gripper_prefix = get_gripper_prefix(max_path.with_suffix('').name)
+            if gripper_prefix:
+                motor_data_path = gripper_prefix_to_motor_data_path.get(gripper_prefix, None)
+                if motor_data_path is not None:
+                    shutil.move(motor_data_path, input_dir.joinpath('mapping_motor.jsonl'))
+
+                uvc_video_path = gripper_prefix_to_uvc_video_path.get(gripper_prefix, None)
+                if uvc_video_path is not None:
+                    shutil.move(uvc_video_path, input_dir.joinpath('mapping_uvc.mp4'))
+                    uvc_data_path = gripper_prefix_to_uvc_data_path.get(gripper_prefix, None)
+                    if uvc_data_path is not None:
+                        shutil.move(uvc_data_path, input_dir.joinpath('mapping_uvc.jsonl'))
+
             print(f"raw_videos/mapping.mp4 don't exist! Renaming largest file {max_path.name}.")
+
+        # 在 mapping 移动后，记录每个 gripper 的第一个视频（用于 calibration）
+        for mp4_path in list(input_dir.glob('**/*.MP4')) + list(input_dir.glob('**/*.mp4')):
+            name_without_ext = mp4_path.with_suffix('').name
+            if name_without_ext.startswith('mapping') or not is_gopro_video(name_without_ext):
+                continue
+            episode_str, gripper_str = parse_episode_gripper(name_without_ext)
+            if gripper_str:
+                start_date = mp4_get_start_datetime(str(mp4_path))
+                if gripper_str not in gripper_id_first_video or start_date < gripper_id_first_video[gripper_str][0]:
+                    gripper_id_first_video[gripper_str] = (start_date, mp4_path)
+
         # create gripper calibration video if don't exist (one per gripper)
         for gripper_str, (start_date, mp4_path) in gripper_id_first_video.items():
             gripper_cal_dir = output_dir.joinpath(f'gripper_calibration_{gripper_str}')
@@ -221,10 +256,17 @@ def main(session_dir):
                     print(f"Skipping {mp4_path.name}, already moved.")
                     continue
 
-                # special folders
+                # 检查文件是否存在（UVC 视频可能在处理对应 GoPro 时已被移动）
+                if not mp4_path.exists():
+                    continue
+
+                # special folders (mapping.mp4 已被重命名，不符合 GoPro 模式，需要先检查)
                 if mp4_path.name.startswith('mapping'):
                     out_dname = "mapping"
                 else:
+                    # 只处理 GoPro 视频（白名单：_GX{6digits}），其他数据随 GoPro 一起处理
+                    if not is_gopro_video(mp4_path.stem):
+                        continue
                     name_without_ext = mp4_path.with_suffix('').name
                     episode_str, gripper_str = validate_filename_format(
                         name_without_ext,
@@ -241,34 +283,39 @@ def main(session_dir):
                 out_video_path = this_out_dir.joinpath(vfname)
                 shutil.move(mp4_path, out_video_path)
 
-                # move imu jsons
+                # move sensor data
                 if out_dname == "mapping":
                     imu_path = input_dir.joinpath("mapping_imu.json")
-                    out_imu_path = this_out_dir.joinpath("imu_data.json")
-                    shutil.move(imu_path, out_imu_path)
-                    motor_data_path = input_dir.joinpath("mapping_motor.npz")
-                    out_motor_data_path = this_out_dir.joinpath("motor_data.npz")
-                    shutil.move(motor_data_path, out_motor_data_path)
-                    motor_meta_data_path = input_dir.joinpath("mapping_motor_meta.json")
-                    out_motor_meta_data_path = this_out_dir.joinpath("motor_meta_data.json")
-                    shutil.move(motor_meta_data_path, out_motor_meta_data_path)
+                    if imu_path.exists():
+                        shutil.move(imu_path, this_out_dir.joinpath("imu_data.json"))
+                    motor_data_path = input_dir.joinpath("mapping_motor.jsonl")
+                    if motor_data_path.exists():
+                        shutil.move(motor_data_path, this_out_dir.joinpath("motor_data.jsonl"))
+                    uvc_video_path = input_dir.joinpath("mapping_uvc.mp4")
+                    if uvc_video_path.exists():
+                        shutil.move(uvc_video_path, this_out_dir.joinpath("uvc_video.mp4"))
+                    uvc_data_path = input_dir.joinpath("mapping_uvc.jsonl")
+                    if uvc_data_path.exists():
+                        shutil.move(uvc_data_path, this_out_dir.joinpath("uvc_data.jsonl"))
                 else:
                     imu_path = mp4_name_to_imu_json_name.get(mp4_path.with_suffix('').name, None)
-                    if imu_path is not None:
+                    if imu_path is not None and imu_path.exists():
                         shutil.move(imu_path, this_out_dir.joinpath("imu_data.json"))
 
                     # Move motor and UVC using gripper prefix
+                    # Note: Multiple videos (GoPro + UVC) may share the same gripper_prefix,
+                    # so we check if files still exist before moving (they may have been moved already)
                     gripper_prefix = get_gripper_prefix(mp4_path.with_suffix('').name)
                     if gripper_prefix:
                         motor_data_path = gripper_prefix_to_motor_data_path.get(gripper_prefix, None)
-                        if motor_data_path is not None:
+                        if motor_data_path is not None and motor_data_path.exists():
                             shutil.move(motor_data_path, this_out_dir.joinpath("motor_data.jsonl"))
 
                         uvc_video_path = gripper_prefix_to_uvc_video_path.get(gripper_prefix, None)
-                        if uvc_video_path is not None:
+                        if uvc_video_path is not None and uvc_video_path.exists():
                             shutil.move(uvc_video_path, this_out_dir.joinpath("uvc_video.mp4"))
                             uvc_data_path = gripper_prefix_to_uvc_data_path.get(gripper_prefix, None)
-                            if uvc_data_path is not None:
+                            if uvc_data_path is not None and uvc_data_path.exists():
                                 shutil.move(uvc_data_path, this_out_dir.joinpath("uvc_data.jsonl"))
                 # create symlink back from original location
                 # relative_to's walk_up argument is not avaliable until python 3.12

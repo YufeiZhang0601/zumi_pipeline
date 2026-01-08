@@ -84,6 +84,9 @@ class MotorControl:
             print("Serial port is open")
             serial_device.close()
         self.serial_.open()
+        # Clear buffers to remove any residual data from previous runs
+        self.serial_.reset_input_buffer()
+        self.serial_.reset_output_buffer()
 
     def controlMIT(self, DM_Motor, kp: float, kd: float, q: float, dq: float, tau: float):
         """

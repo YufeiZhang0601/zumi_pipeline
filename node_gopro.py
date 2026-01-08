@@ -147,7 +147,7 @@ class GoProNode(NodeHTTPService):
     RECOVERY_BACKOFF_BASE = 3.0
     RECOVERY_BACKOFF_MAX = 30.0
 
-    def __init__(self, gripper_id: str = None, mute_on_start=True):
+    def __init__(self, gripper_id: str = None, mute_on_start=True, port: int = None):
         self.gripper_id = gripper_id or get_default_gripper_id()
         self.mute_on_start = mute_on_start
         self.current_run_id = None
@@ -155,7 +155,7 @@ class GoProNode(NodeHTTPService):
         self.is_downloading = False
         self.download_history = {}  # {(run_id, episode): (folder, filename)}
         self._download_task = None  # (run_id, episode, folder, filename) for current download
-        super().__init__(name=f"gopro_{self.gripper_id}", host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
+        super().__init__(name=f"gopro_{self.gripper_id}", host=HTTP_CONF.GOPRO_HOST, port=port or HTTP_CONF.GOPRO_PORT)
         self._remove_default_download_route()
         self._setup_gopro_routes()
 
@@ -333,27 +333,9 @@ class GoProNode(NodeHTTPService):
             if old_motor_jsonl.exists():
                 try:
                     old_motor_jsonl.rename(new_motor_jsonl)
-                    logger.info(f"[Sync] Renamed motor file: {old_motor_jsonl} -> {new_motor_jsonl}")
+                    logger.info(f"[Sync] Renamed motor file: {old_motor_jsonl.name} -> {new_motor_jsonl.name}")
                 except Exception as exc:
                     logger.error(f"[Sync] Failed to rename motor file: {exc}")
-
-            # Legacy: also check for old npz format
-            old_motor_npz = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor.npz"
-            new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor.npz"
-            if old_motor_npz.exists():
-                try:
-                    old_motor_npz.rename(new_motor_npz)
-                    logger.info(f"[Sync] Renamed motor file: {old_motor_npz} -> {new_motor_npz}")
-                except Exception as exc:
-                    logger.error(f"[Sync] Failed to rename motor file: {exc}")
-
-            old_motor_meta = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor_meta.json"
-            new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor_meta.json"
-            if old_motor_meta.exists():
-                try:
-                    old_motor_meta.rename(new_motor_meta)
-                except Exception:
-                    pass
 
             logger.info(f"[Download] Success: {save_name}")
         except Exception as exc:
@@ -529,5 +511,5 @@ if __name__ == "__main__":
     parser.add_argument("--no-mute", action="store_true", help="Disable audio mute on start")
     args = parser.parse_args()
 
-    node = GoProNode(gripper_id=args.gripper_id, mute_on_start=not args.no_mute)
-    node.run(port=args.port)
+    node = GoProNode(gripper_id=args.gripper_id, mute_on_start=not args.no_mute, port=args.port)
+    node.start()

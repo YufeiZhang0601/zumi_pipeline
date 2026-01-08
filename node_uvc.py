@@ -141,7 +141,7 @@ class UvcNode(NodeHTTPService):
     RECOVERY_BACKOFF_BASE = 2.0
     RECOVERY_BACKOFF_MAX = 30.0
 
-    def __init__(self, gripper_id: str = None):
+    def __init__(self, gripper_id: str = None, port: int = None):
         self.gripper_id = gripper_id or get_default_gripper_id()
         self.shm_manager: Optional[SharedMemoryManager] = None
         self.camera: Optional[UvcCamera] = None
@@ -149,7 +149,7 @@ class UvcNode(NodeHTTPService):
         self.sidecar_stop: Optional[threading.Event] = None
         self.current_video: Optional[Path] = None
         self.current_meta: Optional[Path] = None
-        super().__init__(name=f"uvc_{self.gripper_id}", host=HTTP_CONF.UVC_HOST, port=HTTP_CONF.UVC_PORT)
+        super().__init__(name=f"uvc_{self.gripper_id}", host=HTTP_CONF.UVC_HOST, port=port or HTTP_CONF.UVC_PORT)
 
     # Lifecycle ---------------------------------------------------------------
     def on_init(self):
@@ -528,5 +528,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=HTTP_CONF.UVC_PORT, help="HTTP port")
     args = parser.parse_args()
 
-    node = UvcNode(gripper_id=args.gripper_id)
-    node.run(port=args.port)
+    node = UvcNode(gripper_id=args.gripper_id, port=args.port)
+    node.start()

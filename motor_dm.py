@@ -1,3 +1,5 @@
+import time
+
 from motor_interface import MotorDriver, MotorState
 
 
@@ -24,13 +26,37 @@ class DMMotorDriver(MotorDriver):
         if not self.ser.is_open:
             self.ser.open()
 
+        # Clear serial buffers to remove any residual data from previous runs
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
         self.motor = Motor(DM_Motor_Type.DMH3510, self.slave_id, self.master_id)
         self.ctrl = MotorControl(self.ser)
         self.ctrl.addMotor(self.motor)
 
-        if not self.ctrl.switchControlMode(self.motor, Control_Type.MIT):
+        # Try to disable motor first to clear any residual state
+        try:
+            self.ctrl.disable(self.motor)
+            time.sleep(0.2)
+        except Exception:
+            pass
+
+        # Switch to MIT mode with retry mechanism
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self.ctrl.switchControlMode(self.motor, Control_Type.MIT):
+                break
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                # Try disable again before retry
+                try:
+                    self.ctrl.disable(self.motor)
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+        else:
             raise RuntimeError(
-                f"Motor init failed: check connection and ID config "
+                f"Motor init failed after {max_retries} attempts: check connection and ID config "
                 f"(SlaveID={hex(slave_id)}, MasterID={hex(master_id)}, Port={serial_port})"
             )
 
@@ -61,9 +87,18 @@ class DMMotorDriver(MotorDriver):
         )
 
     def shutdown(self):
-        self.disable()
+        # Try to disable motor multiple times to ensure clean state
+        for _ in range(3):
+            try:
+                self.ctrl.disable(self.motor)
+                time.sleep(0.1)
+            except Exception:
+                pass
+
         if getattr(self, "ser", None) and self.ser.is_open:
             try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
                 self.ser.close()
             except Exception:
                 pass
