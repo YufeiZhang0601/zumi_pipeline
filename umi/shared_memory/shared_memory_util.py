@@ -1,8 +1,10 @@
 from typing import Tuple
 from dataclasses import dataclass
+from multiprocessing import Value
+import ctypes
 import numpy as np
 from multiprocessing.managers import SharedMemoryManager
-from atomics import atomicview, MemoryOrder, UINT
+
 
 @dataclass
 class ArraySpec:
@@ -12,28 +14,27 @@ class ArraySpec:
 
 
 class SharedAtomicCounter:
-    def __init__(self, 
-            shm_manager: SharedMemoryManager, 
-            size :int=8 # 64bit int
-            ):
-        shm = shm_manager.SharedMemory(size=size)
-        self.shm = shm
-        self.size = size
-        self.store(0) # initialize
+    """
+    Process-safe atomic counter using multiprocessing.Value.
 
-    @property
-    def buf(self):
-        return self.shm.buf[:self.size]
+    Note: shm_manager parameter is kept for API compatibility but no longer used.
+    The counter is now backed by multiprocessing.Value which handles its own
+    shared memory internally.
+    """
+    def __init__(self,
+            shm_manager: SharedMemoryManager = None,
+            size: int = 8  # 64bit int (unused, kept for compatibility)
+            ):
+        # Use multiprocessing.Value for atomic operations
+        # c_ulonglong = unsigned 64-bit integer
+        self._value = Value(ctypes.c_ulonglong, 0, lock=True)
 
     def load(self) -> int:
-        with atomicview(buffer=self.buf, atype=UINT) as a: 
-            value = a.load(order=MemoryOrder.ACQUIRE)
-        return value
-    
+        return self._value.value
+
     def store(self, value: int):
-        with atomicview(buffer=self.buf, atype=UINT) as a:
-            a.store(value, order=MemoryOrder.RELEASE)
-    
+        self._value.value = value
+
     def add(self, value: int):
-        with atomicview(buffer=self.buf, atype=UINT) as a:
-            a.add(value, order=MemoryOrder.ACQ_REL)
+        with self._value.get_lock():
+            self._value.value += value

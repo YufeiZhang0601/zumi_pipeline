@@ -36,14 +36,15 @@ def test_generate_and_infer_episode():
 
 
 def test_status_helpers():
-    expected = ["go_pro_node", "DM3510"]
+    expected = ["go_pro_node", "DM3510", "uvc_node"]
     now = time.time()
     status_map = {
         "go_pro_node": {"status": "READY", "ts": now},
         "DM3510": {"status": "READY", "ts": now},
+        "uvc_node": {"status": "READY", "ts": now},
     }
     line = orchestrator.format_status_line(status_map, expected)
-    assert "go_pro_node" in line and "DM3510" in line
+    assert "go_pro_node" in line and "DM3510" in line and "uvc_node" in line
     result = orchestrator.classify(status_map, expected)
     assert result["all_ready"] is True
 

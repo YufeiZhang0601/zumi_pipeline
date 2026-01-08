@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -470,6 +470,39 @@ class GoProNode(NodeHTTPService):
 
         self.current_run_id = None
         self.current_episode = None
+
+
+def _find_episode_video(run_id: str, episode: int) -> Optional[Path]:
+    ep_tag = f"ep{int(episode):03d}"
+    run_dir = STORAGE_CONF.DATA_DIR / run_id
+    candidates = sorted(run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"))
+    if not candidates:
+        # Legacy pattern without ep tag
+        candidates = sorted(run_dir.glob(f"{run_id}_*.MP4"))
+    return candidates[0] if candidates else None
+
+
+def validate(run_id: str, episode: int):
+    from validator import ValidationResult, check_video_decoding, extract_imu, get_imu_start_time
+
+    video_path = _find_episode_video(run_id, episode)
+    if not video_path or not video_path.exists():
+        return ValidationResult(False, "video_missing", "GoPro video not found")
+    if video_path.stat().st_size < 1024:
+        return ValidationResult(False, "video_corrupt", "GoPro video too small")
+
+    if not check_video_decoding(video_path):
+        return ValidationResult(False, "video_corrupt", "GoPro video decode failed")
+
+    imu_json = video_path.with_name(video_path.name.replace(".MP4", "_imu.json"))
+    if not imu_json.exists():
+        if not extract_imu(video_path, imu_json):
+            return ValidationResult(False, "imu_extraction_failed", "GoPro IMU extract failed")
+    imu_start = get_imu_start_time(imu_json)
+    if not imu_start:
+        return ValidationResult(False, "imu_invalid", "GoPro IMU invalid")
+
+    return ValidationResult(True)
 
 
 if __name__ == "__main__":

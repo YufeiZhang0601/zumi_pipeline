@@ -34,3 +34,4 @@ data/*
 *.mp4
 *.json
 .env
+debug_data/*

@@ -1,139 +1,48 @@
-import sys
-import os
+import importlib
 import json
-import re
-import numpy as np
-import subprocess
 import logging
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, List, Optional, Tuple
 
 from zumi_config import STORAGE_CONF
+
+logging.basicConfig(level=logging.INFO, format="[VALIDATOR] %(message)s")
+logger = logging.getLogger("Validator")
+
+
+# -----------------------------------------------------------------------------
+# Result type
+# -----------------------------------------------------------------------------
 
 
 @dataclass
 class ValidationResult:
     success: bool
-    error: Optional[str] = None  # "video_missing", "motor_missing", "video_corrupt", "sync_error", etc.
+    error: Optional[str] = None  # "video_missing", "motor_missing", "video_corrupt", etc.
     message: Optional[str] = None
 
-# Configuration
-DATA_DIR = STORAGE_CONF.DATA_DIR
-DOCKER_IMAGE = "chicheng/openicc"
-ZERO_NAN_RATIO_THRESHOLD = 0.9
-ZERO_EPS = 0.0
-START_ZERO_DURATION = 0.5
-START_ZERO_TOL = (np.pi / 180) * 0.5 # 0.5 degrees
 
-logging.basicConfig(level=logging.INFO, format='[VALIDATOR] %(message)s')
-logger = logging.getLogger("Validator")
+# -----------------------------------------------------------------------------
+# Utility helpers (shared by node validators)
+# -----------------------------------------------------------------------------
 
-def get_video_creation_time(file_path):
-    """
-    Get the creation_time from the video metadata using ffprobe.
-    Returns a unix timestamp (float).
-    """
-    try:
-        cmd = [
-            "ffprobe", "-v", "quiet", 
-            "-select_streams", "v:0", 
-            "-show_entries", "stream_tags=creation_time", 
-            "-of", "default=noprint_wrappers=1:nokey=1", 
-            str(file_path)
-        ]
-        output = subprocess.check_output(cmd).decode().strip()
-        if output:
-            dt = datetime.strptime(output, "%Y-%m-%dT%H:%M:%S.%fZ")
-            return dt.replace(tzinfo=timezone.utc).timestamp()
-    except Exception as e:
-        logger.warning(f"Could not get video creation time: {e}")
-    return None
 
-def extract_imu(video_path, json_path):
-    video_path = Path(video_path).resolve()
-    json_path = Path(json_path).resolve()
-    
-    # Logic: map the user's home directory to /data in docker
-    # This preserves the relative path structure inside the container
-    home_dir = Path.home()
-    
-    try:
-        if video_path.is_relative_to(home_dir):
-            mount_source = home_dir
-            rel_video_path = video_path.relative_to(home_dir)
-            
-            # Docker paths
-            docker_video_path = Path("/data") / rel_video_path
-            
-            # For JSON, we want it explicitly where requested, assuming it's also under home
-            if json_path.is_relative_to(home_dir):
-                 rel_json_path = json_path.relative_to(home_dir)
-                 docker_json_path = Path("/data") / rel_json_path
-            else:
-                 # Fallback if JSON path is outside home (unlikely but safe)
-                 docker_json_path = Path("/data") / json_path.name
-                 
-        else:
-            # Fallback: Mount the video's parent directory directly
-            mount_source = video_path.parent
-            docker_video_path = Path("/data") / video_path.name
-            docker_json_path = Path("/data") / json_path.name
-
-        docker_cmd = [
-            "docker", "run", "--rm",
-            "--volume", f"{mount_source}:/data",
-            DOCKER_IMAGE,
-            "node", "/OpenImuCameraCalibrator/javascript/extract_metadata_single.js",
-            str(docker_video_path),
-            str(docker_json_path)
-        ]
-        
-        subprocess.run(docker_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        logger.error("Docker extraction failed.")
-        return False
-    except FileNotFoundError:
-        logger.error("Docker not found.")
-        return False
-    except Exception as e:
-        logger.error(f"Error preparing docker command: {e}")
-        return False
-
-def get_imu_start_time(json_path):
-    try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        
-        # Strategy 1: OpenImuCameraCalibrator structure
-        for key, val in data.items():
-            if isinstance(val, dict) and "streams" in val:
-                streams = val["streams"]
-                if "ACCL" in streams and "samples" in streams["ACCL"]:
-                     samples = streams["ACCL"]["samples"]
-                     if samples:
-                         date_str = samples[0].get("date")
-                         if date_str:
-                             if date_str.endswith("Z"): date_str = date_str.replace("Z", "+00:00")
-                             return datetime.fromisoformat(date_str).timestamp()
-                             
-        # Strategy 2: Flat structure
-        if "start_time" in data:
-            return float(data["start_time"])
-            
-    except Exception as e:
-        logger.warning(f"Failed to parse IMU JSON: {e}")
-    return None
-
-def check_video_decoding(video_path):
+def check_video_decoding(video_path: Path, seconds: int = 5) -> bool:
     cmd = [
-        "ffmpeg", "-v", "error", 
-        "-i", str(video_path), 
-        "-t", "5", 
-        "-an", 
-        "-f", "null", "-"
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(video_path),
+        "-t",
+        str(seconds),
+        "-an",
+        "-f",
+        "null",
+        "-",
     ]
     try:
         subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
@@ -143,270 +52,166 @@ def check_video_decoding(video_path):
         return False
 
 
-def parse_episode_from_name(run_id, name):
-    match = re.search(rf"^{re.escape(run_id)}_ep(\d+)_", name)
-    if match:
-        try:
-            return int(match.group(1))
-        except Exception:
-            return 1
-    if name.startswith(f"{run_id}_"):
-        return 1
+def get_video_duration(video_path: Path) -> Optional[float]:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        out = subprocess.check_output(cmd).decode().strip()
+        return float(out)
+    except Exception as exc:
+        logger.warning(f"Could not read duration for {video_path}: {exc}")
+        return None
+
+
+def get_video_creation_time(file_path: Path) -> Optional[float]:
+    """
+    Get creation_time from video metadata via ffprobe (UTC timestamp).
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_tags=creation_time",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ]
+        output = subprocess.check_output(cmd).decode().strip()
+        if output:
+            dt = datetime.strptime(output, "%Y-%m-%dT%H:%M:%S.%fZ")
+            return dt.replace(tzinfo=timezone.utc).timestamp()
+    except Exception as exc:
+        logger.warning(f"Could not get video creation time: {exc}")
     return None
 
 
-def ep_tag(ep):
+def extract_imu(video_path: Path, json_path: Path) -> bool:
+    video_path = Path(video_path).resolve()
+    json_path = Path(json_path).resolve()
+
     try:
-        return f"ep{int(ep):03d}"
-    except Exception:
-        return "ep001"
+        docker_cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--volume",
+            f"{video_path.parent}:/data",
+            "chicheng/openicc",
+            "node",
+            "/OpenImuCameraCalibrator/javascript/extract_metadata_single.js",
+            f"/data/{video_path.name}",
+            f"/data/{json_path.name}",
+        ]
+
+        subprocess.run(docker_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except subprocess.CalledProcessError:
+        logger.error("Docker extraction failed.")
+        return False
+    except FileNotFoundError:
+        logger.error("Docker not found.")
+        return False
+    except Exception as exc:
+        logger.error(f"Error preparing docker command: {exc}")
+        return False
 
 
-def list_episode_videos(run_id, episode=None):
-    """List videos in the run_id directory."""
-    run_dir = DATA_DIR / run_id
-    videos = []
-    if not run_dir.exists():
-        return videos
+def get_imu_start_time(json_path: Path) -> Optional[float]:
+    try:
+        with open(json_path, "r") as f:
+            data = json.load(f)
 
-    for path in run_dir.glob(f"{run_id}_ep*_*.MP4"):
-        ep_val = parse_episode_from_name(run_id, path.name)
-        if ep_val and (episode is None or ep_val == episode):
-            videos.append((ep_val, path))
-    if not videos:
-        for path in run_dir.glob(f"{run_id}_*.MP4"):
-            ep_val = parse_episode_from_name(run_id, path.name)
-            if ep_val and (episode is None or ep_val == episode):
-                videos.append((ep_val, path))
-    videos.sort(key=lambda x: (x[0], x[1].name))
-    return videos
+        for key, val in data.items():
+            if isinstance(val, dict) and "streams" in val:
+                streams = val["streams"]
+                if "ACCL" in streams and "samples" in streams["ACCL"]:
+                    samples = streams["ACCL"]["samples"]
+                    if samples:
+                        date_str = samples[0].get("date")
+                        if date_str:
+                            if date_str.endswith("Z"):
+                                date_str = date_str.replace("Z", "+00:00")
+                            return datetime.fromisoformat(date_str).timestamp()
 
+        if "start_time" in data:
+            return float(data["start_time"])
 
-def extract_gopro_tag(video_path, run_id, episode):
-    name = video_path.name
-    prefix = f"{run_id}_{ep_tag(episode)}_"
-    if name.startswith(prefix):
-        return name[len(prefix):].replace(".MP4", "")
-    legacy_prefix = f"{run_id}_"
-    if name.startswith(legacy_prefix):
-        return name[len(legacy_prefix):].replace(".MP4", "")
-    return video_path.stem
-
-def normalize_run_files(run_id, episode, gopro_tag):
-    """
-    Handles motor file naming for a given run/episode/gopro_tag.
-    Returns the resolved motor path.
-    """
-    run_dir = DATA_DIR / run_id
-    tag = ep_tag(episode)
-    target_motor_npz = run_dir / f"{run_id}_{tag}_{gopro_tag}_motor.npz"
-    target_motor_json = run_dir / f"{run_id}_{tag}_{gopro_tag}_motor.json"
-
-    generic_motor_npz = run_dir / f"{run_id}_{tag}_motor.npz"
-    generic_motor_json = run_dir / f"{run_id}_{tag}_motor.json"
-
-    # Episode-aware rename
-    if generic_motor_npz.exists() and not target_motor_npz.exists():
-        try:
-            generic_motor_npz.rename(target_motor_npz)
-            print(f"[INFO] Renamed motor file to: {target_motor_npz.name}")
-        except Exception as e:
-            print(f"[WARN] Failed to rename motor file: {e}")
-            return generic_motor_npz
-
-    if generic_motor_json.exists() and not target_motor_json.exists():
-        try:
-            generic_motor_json.rename(target_motor_json)
-        except Exception:
-            pass
-
-    if target_motor_npz.exists():
-        return target_motor_npz
-    if generic_motor_npz.exists():
-        return generic_motor_npz
-    if target_motor_json.exists():
-        return target_motor_json
-    if generic_motor_json.exists():
-        return generic_motor_json
-
-    # Fallback: already renamed with gopro tag
-    existing = list(run_dir.glob(f"{run_id}_{tag}_*_motor.npz"))
-    if existing:
-        return existing[0]
-
+    except Exception as exc:
+        logger.warning(f"Failed to parse IMU JSON: {exc}")
     return None
 
-def validate_episode(run_id, episode, video_path) -> ValidationResult:
-    tag = ep_tag(episode)
-    print(f"\n=== Validating Run: {run_id} {tag} ===")
 
-    # 1. Video checks
-    if not video_path or not video_path.exists():
-        print("[FAIL] Video file missing.")
-        return ValidationResult(False, "video_missing", "Video file not found")
-    if video_path.stat().st_size < 1024:
-        msg = f"Video file too small ({video_path.stat().st_size} bytes)"
-        print(f"[FAIL] {msg}")
-        return ValidationResult(False, "video_corrupt", msg)
-    print(f"[PASS] Video file found: {video_path}")
-
-    # 2. Normalize and locate motor data
-    gopro_tag = extract_gopro_tag(video_path, run_id, episode)
-    motor_path = normalize_run_files(run_id, episode, gopro_tag)
-
-    if not motor_path or not motor_path.exists():
-        print("[FAIL] Motor data missing.")
-        return ValidationResult(False, "motor_missing", "Motor data not found")
-
-    if motor_path.stat().st_size < 1024:
-        msg = f"Motor data too small ({motor_path.stat().st_size} bytes)"
-        print(f"[FAIL] {msg}")
-        return ValidationResult(False, "motor_corrupt", msg)
-
-    print(f"[PASS] Motor data found: {motor_path}")
-
-    # 3. Motor content
-    motor_start_ts = None
-    try:
-        if motor_path.suffix == ".npz":
-            with np.load(motor_path) as data:
-                arr = np.asarray(data["data"], dtype=np.float64)
-        else:
-            with open(motor_path, "r") as f:
-                arr = np.asarray(json.load(f), dtype=np.float64)
-
-        if arr.size == 0 or len(arr) == 0:
-            print("[FAIL] Motor data empty.")
-            return ValidationResult(False, "motor_empty", "Motor data is empty")
-        if arr.ndim != 2 or arr.shape[1] < 2:
-            msg = f"Motor data has unexpected shape {arr.shape}"
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_corrupt", msg)
-
-        motor_start_ts = arr[0, 0]
-        motor_end_ts = arr[-1, 0]
-        count = len(arr)
-
-        # Detect zero/NaN dominated streams (ignore timestamp/iteration columns)
-        value_cols = arr[:, 1:4] if arr.shape[1] >= 4 else arr[:, 1:]
-        if value_cols.size == 0:
-            msg = "Motor data missing value columns."
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_corrupt", msg)
-
-        finite_mask = np.isfinite(value_cols)
-        zero_mask = np.abs(value_cols) <= ZERO_EPS
-        zero_or_nan = (~finite_mask) | zero_mask
-        zero_ratio = zero_or_nan.sum() / value_cols.size
-
-        if zero_ratio >= 1.0:
-            msg = "Motor data contains only zeros/NaNs."
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_flat", msg)
-        if zero_ratio >= ZERO_NAN_RATIO_THRESHOLD:
-            msg = f"Motor data zeros/NaNs too high ({zero_ratio:.1%} >= {ZERO_NAN_RATIO_THRESHOLD:.0%})."
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_flat", msg)
-
-        # Require first 0.5s to be near-zero (gripper at rest)
-        start_window_mask = arr[:, 0] - motor_start_ts <= START_ZERO_DURATION
-        start_positions = arr[start_window_mask, 1]
-        if start_positions.size == 0:
-            msg = "Motor data missing initial samples for zero-check."
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_corrupt", msg)
-        if not np.all(np.isfinite(start_positions)):
-            msg = "Motor start contains non-finite position values."
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_corrupt", msg)
-
-        pos_mean = float(np.mean(start_positions))
-        pos_p95 = float(np.percentile(np.abs(start_positions), 95))
-        pos_max = float(np.max(np.abs(start_positions)))
-        if abs(pos_mean) > START_ZERO_TOL or pos_p95 > START_ZERO_TOL:
-            msg = (
-                f"Motor start position not zeroed: |mean|={abs(pos_mean):.4f}, "
-                f"p95={pos_p95:.4f} (tol {START_ZERO_TOL})."
-            )
-            print(f"[FAIL] {msg}")
-            return ValidationResult(False, "motor_start_nonzero", msg)
-        print(f"[INFO] Motor start position: mean={pos_mean:.4f}, p95={pos_p95:.4f}, max={pos_max:.4f}")
-
-        duration = motor_end_ts - motor_start_ts
-        freq = count / duration if duration > 0 else 0
-        print(f"[INFO] Motor: {freq:.1f}Hz, {duration:.2f}s")
-
-    except Exception as e:
-        msg = f"Motor data invalid: {e}"
-        print(f"[FAIL] {msg}")
-        return ValidationResult(False, "motor_corrupt", msg)
-
-    # 4. Video & IMU
-    if not check_video_decoding(video_path):
-        print("[FAIL] Video corrupted (ffmpeg check failed).")
-        return ValidationResult(False, "video_corrupt", "Video decode failed")
-    print("[PASS] Video integrity verified (ffmpeg).")
-
-    imu_json_path = video_path.with_name(video_path.name.replace(".MP4", "_imu.json"))
-    if not imu_json_path.exists():
-        print("[INFO] Extracting IMU data...")
-        if not extract_imu(video_path, imu_json_path):
-            print("[FAIL] IMU extraction failed.")
-            return ValidationResult(False, "imu_extraction_failed", "IMU extraction failed")
-
-    imu_start_ts = get_imu_start_time(imu_json_path)
-    if not imu_start_ts:
-        print("[FAIL] IMU data invalid.")
-        return ValidationResult(False, "imu_invalid", "IMU data invalid")
-    print(f"[PASS] IMU data extracted: {imu_json_path.name}")
-
-    # Synchronization
-    video_start_ts = get_video_creation_time(video_path)
-
-    print(f"\nTimestamps:")
-    print(f"  Motor Start: {motor_start_ts:.4f}")
-    if video_start_ts:
-        print(f"  Video Start: {video_start_ts:.4f} (Diff: {video_start_ts - motor_start_ts:+.4f}s)")
-    print(f"  IMU Start:   {imu_start_ts:.4f}   (Diff: {imu_start_ts - motor_start_ts:+.4f}s)")
-
-    diff = abs(imu_start_ts - motor_start_ts)
-    if diff > 1.0:
-        msg = f"Large sync offset between Motor and IMU ({diff:.3f}s > 1.0s)"
-        print(f"[WARN] {msg}")
-        # This is a warning, not a failure
-    else:
-        print(f"[PASS] Synchronization within tolerance ({diff:.3f}s <= 1.0s).")
-
-    print(f"\n=== Run {run_id} {tag}: VALIDATED ===")
-    return ValidationResult(True)
+# -----------------------------------------------------------------------------
+# Runner
+# -----------------------------------------------------------------------------
 
 
-def validate(run_id, episode=None) -> ValidationResult:
-    videos = list_episode_videos(run_id, episode)
-    if not videos:
-        if episode:
-            msg = f"No video found for {run_id} {ep_tag(episode)}"
-            print(f"[FAIL] {msg}.")
-            return ValidationResult(False, "video_missing", msg)
-        else:
-            msg = f"No videos found for {run_id}"
-            print(f"[FAIL] {msg}.")
-            return ValidationResult(False, "video_missing", msg)
+ValidatorFn = Callable[[str, Optional[int]], ValidationResult]
+DEFAULT_VALIDATORS = ["node_gopro", "node_motor", "node_uvc"]
 
-    # For single episode validation, return the result directly
-    if episode is not None:
-        ep_val, video_path = videos[0]
-        return validate_episode(run_id, ep_val, video_path)
 
-    # For run-wide validation, return first failure or success
-    for ep_val, video_path in videos:
-        result = validate_episode(run_id, ep_val, video_path)
+def _load_validators(modules: List[str]) -> List[Tuple[str, ValidatorFn]]:
+    validators: List[Tuple[str, ValidatorFn]] = []
+    for mod_name in modules:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            logger.info(f"Validator module not found: {mod_name}")
+            continue
+        except Exception as exc:
+            logger.error(f"Failed to import validator {mod_name}: {exc}")
+            continue
+
+        fn = getattr(mod, "validate", None)
+        if not callable(fn):
+            logger.warning(f"Validator {mod_name} missing callable validate()")
+            continue
+        validators.append((mod_name, fn))
+    return validators
+
+
+def validate(run_id: str, episode: Optional[int] = None) -> ValidationResult:
+    validators = _load_validators(DEFAULT_VALIDATORS)
+    if not validators:
+        return ValidationResult(False, "validator_missing", "No validators registered")
+
+    for name, fn in validators:
+        try:
+            result = fn(run_id, episode)
+        except Exception as exc:
+            logger.error(f"{name} validator crashed: {exc}")
+            return ValidationResult(False, "validation_error", f"{name} error: {exc}")
+
+        if not isinstance(result, ValidationResult):
+            logger.warning(f"{name} returned unexpected result, skipping")
+            continue
+
         if not result.success:
-            return result
+            # Preserve error/message but annotate source
+            if result.message:
+                msg = f"{name}: {result.message}"
+            else:
+                msg = f"{name} validation failed"
+            return ValidationResult(False, result.error or "validation_failed", msg)
+
     return ValidationResult(True)
 
 
 if __name__ == "__main__":
+    import sys
+
     if len(sys.argv) > 1:
         run_id_arg = sys.argv[1]
         ep_arg = None
@@ -415,6 +220,7 @@ if __name__ == "__main__":
                 ep_arg = int(sys.argv[2])
             except ValueError:
                 ep_arg = None
-        validate(run_id_arg, ep_arg)
+        result = validate(run_id_arg, ep_arg)
+        print(result)
     else:
         print("Usage: python validator.py <run_id> [episode]")

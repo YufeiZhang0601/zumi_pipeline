@@ -951,6 +951,7 @@ def main(delay, run_id, tag, validation_mode):
     clients = [
         NodeClient("go_pro_node", HTTP_CONF.GOPRO_URL),
         NodeClient("DM3510", HTTP_CONF.MOTOR_URL),
+        NodeClient("uvc_node", HTTP_CONF.UVC_URL),
     ]
     expected_names = [c.name for c in clients]
 

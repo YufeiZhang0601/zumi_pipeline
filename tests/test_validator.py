@@ -1,57 +1,35 @@
 import os
 import sys
-import tempfile
-from pathlib import Path
 
-import numpy as np
+import pytest
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-import validator
+import validator  # noqa: E402
 
 
-def build_motor_npz(path: Path):
-    # Minimal motor dataset: timestamps and dummy values
-    data = np.array(
-        [
-            [1.0, 0.0, 0.0, 0.0, 0],
-            [1.01, 0.1, 0.1, 0.0, 1],
-            [1.02, 0.2, 0.2, 0.0, 2],
-        ],
-        dtype=np.float64,
-    )
-    np.savez_compressed(path, data=data, columns=np.array(["ts", "pos", "vel", "tau", "iter"]))
+def test_validator_success(monkeypatch):
+    calls = []
+
+    def fake_validator(run_id, episode):
+        calls.append((run_id, episode))
+        return validator.ValidationResult(True)
+
+    monkeypatch.setattr(validator, "_load_validators", lambda modules: [("fake", fake_validator)])
+
+    result = validator.validate("run_001", 1)
+    assert result.success is True
+    assert calls == [("run_001", 1)]
 
 
-def test_validator_passes_with_motor_only():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        run_id = "run_001"
-        data_dir = Path(tmpdir)
+def test_validator_failure(monkeypatch):
+    def bad_validator(run_id, episode):
+        return validator.ValidationResult(False, "video_missing", "fail")
 
-        # Create run_id directory
-        run_dir = data_dir / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(validator, "_load_validators", lambda modules: [("bad", bad_validator)])
 
-        motor_path = run_dir / f"{run_id}_ep001_motor.npz"
-        build_motor_npz(motor_path)
-
-        # Point validator to temp dir
-        validator.DATA_DIR = data_dir
-
-        assert validator.validate(run_id) is False
-
-
-def test_validator_fails_when_motor_missing():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        run_id = "run_999"
-        data_dir = Path(tmpdir)
-
-        # Create run_id directory (empty)
-        run_dir = data_dir / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        validator.DATA_DIR = data_dir
-
-        assert validator.validate(run_id) is False
+    result = validator.validate("run_001", 1)
+    assert result.success is False
+    assert result.error == "video_missing"

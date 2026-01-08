@@ -34,6 +34,8 @@ class UvcCamera(mp.Process):
             dev_video_path,
             resolution=(1280, 720),
             capture_fps=60,
+            exposure: Optional[float] = None,
+            fourcc: Optional[str] = None,
             put_fps=None,
             put_downsample=True,
             get_max_k=30,
@@ -114,6 +116,8 @@ class UvcCamera(mp.Process):
         self.put_downsample = put_downsample
         self.receive_latency = receive_latency
         self.cap_buffer_size = cap_buffer_size
+        self.exposure = exposure
+        self.fourcc = fourcc
         self.transform = transform
         self.vis_transform = vis_transform
         self.recording_transform = recording_transform
@@ -142,9 +146,18 @@ class UvcCamera(mp.Process):
         self.put_start_time = put_start_time
         shape = self.resolution[::-1]
         data_example = np.empty(shape=shape+(3,), dtype=np.uint8)
-        self.video_recorder.start(
-            shm_manager=self.shm_manager, 
-            data_example=data_example)
+
+        # 第一次调用：setup + start_process
+        if not self.video_recorder.is_setup:
+            self.video_recorder.setup(
+                shm_manager=self.shm_manager,
+                data_example=data_example
+            )
+            self.video_recorder.start_process()
+        else:
+            # 后续调用：只准备录制
+            self.video_recorder.prepare_recording()
+
         # must start video recorder first to create share memories
         super().start()
         if wait:
@@ -206,16 +219,45 @@ class UvcCamera(mp.Process):
 
         # open VideoCapture
         cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            print(f"[UvcCamera] Failed to open device {self.dev_video_path}", flush=True)
+            return
+
+        # Force manual exposure if provided
+        if self.exposure is not None:
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # manual mode on V4L2
+                cap.set(cv2.CAP_PROP_EXPOSURE, float(self.exposure))
+            except Exception:
+                pass
         
         try:
-            # set resolution and fps
+            # set fourcc format first (must be before resolution/fps)
             w, h = self.resolution
             fps = self.capture_fps
+            if self.fourcc:
+                fourcc_code = cv2.VideoWriter_fourcc(*self.fourcc)
+                cap.set(cv2.CAP_PROP_FOURCC, fourcc_code)
+                # Verify FOURCC setting took effect
+                actual_fourcc_raw = int(cap.get(cv2.CAP_PROP_FOURCC))
+                actual_fourcc = ''.join([chr((actual_fourcc_raw >> 8*i) & 0xFF) for i in range(4)])
+                if actual_fourcc != self.fourcc:
+                    print(f"[UvcCamera] WARNING: requested FOURCC={self.fourcc}, actual={actual_fourcc}", flush=True)
+
+            # set resolution and fps
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            # set fps
             cap.set(cv2.CAP_PROP_BUFFERSIZE, self.cap_buffer_size)
             cap.set(cv2.CAP_PROP_FPS, fps)
+
+            # validate settings took effect
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if actual_fps != fps:
+                print(f"[UvcCamera] WARNING: requested FPS={fps}, actual={actual_fps}", flush=True)
+            if (actual_w, actual_h) != (w, h):
+                print(f"[UvcCamera] WARNING: requested resolution={w}x{h}, actual={actual_w}x{actual_h}", flush=True)
 
             # put frequency regulation
             put_idx = None
@@ -226,23 +268,49 @@ class UvcCamera(mp.Process):
             # reuse frame buffer
             iter_idx = 0
             t_start = time.time()
+            t_fps_measure_start = None
+            rec_active = False
+            last_t_cal = None
             while not self.stop_event.is_set():
                 ts = time.time()
                 ret = cap.grab()
-                assert ret
-                
-                # directly write into shared memory to avoid copy
-                frame = self.video_recorder.get_img_buffer()
-                ret, frame = cap.retrieve(frame)
+                if not ret:
+                    print("[UvcCamera] cap.grab failed", flush=True)
+                    time.sleep(0.01)
+                    continue
+
+                # Only request recorder buffers while actively recording
+                # and VideoRecorder is accepting frames (not flushing)
+                use_recorder = rec_active and self.video_recorder.is_accepting_frames()
+                frame = None
+                if use_recorder:
+                    try:
+                        frame = self.video_recorder.get_img_buffer()
+                    except Full:
+                        use_recorder = False
+
+                if use_recorder:
+                    ret, frame = cap.retrieve(frame)
+                else:
+                    ret, frame = cap.retrieve()
                 t_recv = time.time()
-                assert ret
+                if not ret:
+                    print("[UvcCamera] cap.retrieve failed", flush=True)
+                    time.sleep(0.01)
+                    continue
                 mt_cap = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
                 t_cap = mt_cap - time.monotonic() + time.time()
                 t_cal = t_recv - self.receive_latency # calibrated latency
+                last_t_cal = t_cal
                      
                 # record frame
-                if self.video_recorder.is_ready():
-                    self.video_recorder.write_img_buffer(frame, frame_time=t_cal)
+                # Double-check is_accepting_frames in case flush started after get_img_buffer
+                if use_recorder and self.video_recorder.is_accepting_frames():
+                    try:
+                        self.video_recorder.write_img_buffer(frame, frame_time=t_cal)
+                    except Full:
+                        if self.verbose:
+                            print("[UvcCamera] Recorder queue full; dropping frame", flush=True)
 
                 data = dict()
                 data['camera_receive_timestamp'] = t_recv
@@ -254,7 +322,10 @@ class UvcCamera(mp.Process):
                 if self.transform is not None:
                     put_data = self.transform(dict(data))
 
-                if self.put_downsample:                
+                # Track whether we wrote to main buffer (for vis_ring_buffer sync)
+                wrote_to_main = False
+
+                if self.put_downsample:
                     # put frequency regulation
                     local_idxs, global_idxs, put_idx \
                         = get_accumulate_timestamp_idxs(
@@ -272,24 +343,34 @@ class UvcCamera(mp.Process):
                     for step_idx in global_idxs:
                         put_data['step_idx'] = step_idx
                         put_data['timestamp'] = t_cal
-                        self.ring_buffer.put(put_data, wait=False)
+                        self.ring_buffer.put(put_data, wait=True)
+                        wrote_to_main = True
                 else:
                     step_idx = int((t_cal - put_start_time) * self.put_fps)
                     put_data['step_idx'] = step_idx
                     put_data['timestamp'] = t_cal
-                    self.ring_buffer.put(put_data, wait=False)
+                    self.ring_buffer.put(put_data, wait=True)
+                    wrote_to_main = True
 
-                # signal ready
+                # signal ready and measure actual FPS
                 if iter_idx == 0:
+                    t_fps_measure_start = time.time()
                     self.ready_event.set()
+                elif iter_idx == 30 and t_fps_measure_start is not None:
+                    elapsed = time.time() - t_fps_measure_start
+                    measured_fps = 30 / elapsed
+                    if abs(measured_fps - fps) > fps * 0.15:  # >15% deviation
+                        print(f"[UvcCamera] WARNING: configured FPS={fps}, measured FPS={measured_fps:.1f}", flush=True)
+                    t_fps_measure_start = None  # Only measure once
                     
-                # put to vis
-                vis_data = data
-                if self.vis_transform == self.transform:
-                    vis_data = put_data
-                elif self.vis_transform is not None:
-                    vis_data = self.vis_transform(dict(data))
-                self.vis_ring_buffer.put(vis_data, wait=False)
+                # put to vis (skip if main buffer skipped due to rate regulation)
+                if wrote_to_main:
+                    vis_data = data
+                    if self.vis_transform == self.transform:
+                        vis_data = put_data
+                    elif self.vis_transform is not None:
+                        vis_data = self.vis_transform(dict(data))
+                    self.vis_ring_buffer.put(vis_data, wait=False)
 
                 # perf
                 t_end = time.time()
@@ -306,6 +387,12 @@ class UvcCamera(mp.Process):
                     n_cmd = len(commands['cmd'])
                 except Empty:
                     n_cmd = 0
+                except Exception as e:
+                    # Catch all other exceptions to avoid killing VideoRecorder
+                    # (Any unhandled exception would trigger finally block which stops VideoRecorder)
+                    print(f"[UvcCamera] Command queue error: {type(e).__name__}: {e}", flush=True)
+                    n_cmd = 0
+                    time.sleep(0.1)  # Brief wait before retry
 
                 # execute commands
                 for i in range(n_cmd):
@@ -313,21 +400,28 @@ class UvcCamera(mp.Process):
                     for key, value in commands.items():
                         command[key] = value[i]
                     cmd = command['cmd']
-                    if cmd == Command.RESTART_PUT.value:
-                        put_idx = None
-                        put_start_time = command['put_start_time']
-                    elif cmd == Command.START_RECORDING.value:
-                        video_path = str(command['video_path'])
-                        start_time = command['recording_start_time']
-                        if start_time < 0:
-                            start_time = None
-                        self.video_recorder.start_recording(video_path, start_time=start_time)
-                    elif cmd == Command.STOP_RECORDING.value:
-                        self.video_recorder.stop_recording()
+                    try:
+                        if cmd == Command.RESTART_PUT.value:
+                            put_idx = None
+                            put_start_time = command['put_start_time']
+                        elif cmd == Command.START_RECORDING.value:
+                            video_path = str(command['video_path'])
+                            start_time = command['recording_start_time']
+                            if (start_time is None) or (start_time < 0):
+                                start_time = last_t_cal if last_t_cal is not None else time.time()
+                            self.video_recorder.start_recording(video_path, start_time=start_time)
+                            rec_active = True
+                        elif cmd == Command.STOP_RECORDING.value:
+                            self.video_recorder.stop_recording()
+                            rec_active = False
+                    except Exception as e:
+                        print(f"[UvcCamera] Command execution error (cmd={cmd}): {type(e).__name__}: {e}", flush=True)
+                        import traceback
+                        traceback.print_exc()
 
                 iter_idx += 1
         finally:
+            print("[UvcCamera] Process exiting", flush=True)
             self.video_recorder.stop()
             # When everything done, release the capture
             cap.release()
-
