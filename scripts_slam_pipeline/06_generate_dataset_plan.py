@@ -5,6 +5,7 @@ python scripts_slam_pipeline/06_generate_dataset_plan.py -i data_workspace/cup_i
 # %%
 import sys
 import os
+import re
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -79,6 +80,71 @@ def get_x_projection(tx_tag_this, tx_tag_other):
     proj_other_right = np.sum(v_this_right * t_this_other, axis=-1)
     return proj_other_right
 
+def parse_demo_dir_name(dir_name):
+    """Parse episode and gripper id from demo directory name.
+
+    Strictly matches 'demo_ep{N}_gp{XX}'.
+    Directories with suffixes (e.g. _backup) will be ignored.
+
+    Args:
+        dir_name: Directory name like 'demo_ep001_gp00'
+
+    Returns:
+        Tuple of (episode_num: int, gripper_id: int) or (None, None) if not matched
+    """
+    match = re.match(r'demo_ep(\d+)_gp(\d+)$', dir_name)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None, None
+
+def parse_gripper_cal_dir_name(dir_name):
+    """Parse gripper id from gripper calibration directory name."""
+    match = re.search(r'gp(\d+)', dir_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+def load_motor_jsonl(path):
+    """Load motor data from JSONL format."""
+    ts_list = []
+    pos_list = []
+    with open(path, 'r') as f:
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+                ts_list.append(data['ts'])
+                pos = data['pos']
+                pos_list.append(pos[0] if isinstance(pos, list) else pos)
+    return np.array(ts_list), np.array(pos_list)
+
+def get_uvc_info(video_dir):
+    """Get UVC video and timestamp info for a demo directory."""
+    uvc_video_path = video_dir.joinpath('uvc_video.mp4')
+    uvc_data_path = video_dir.joinpath('uvc_data.jsonl')
+
+    if not uvc_video_path.is_file() or not uvc_data_path.is_file():
+        return None
+
+    uvc_timestamps = []
+    with open(uvc_data_path, 'r') as f:
+        for line in f:
+            if line.strip():
+                data = json.loads(line)
+                uvc_timestamps.append(data['ts'])
+
+    with av.open(str(uvc_video_path), 'r') as container:
+        stream = container.streams.video[0]
+        n_frames = stream.frames
+        fps = float(stream.average_rate)
+
+    return {
+        'video_path': uvc_video_path,
+        'data_path': uvc_data_path,
+        'timestamps': np.array(uvc_timestamps),
+        'n_frames': n_frames,
+        'fps': fps
+    }
+
 # %%
 @click.command()
 @click.option('-i', '--input', required=True, help='Project directory')
@@ -134,12 +200,15 @@ def main(input, output, tcp_offset, tx_slam_tag,
             meta = list(et.get_metadata(str(mp4_path)))[0]
             cam_serial = meta['QuickTime:CameraSerialNumber']
 
+            # Parse gripper_id from directory name instead of JSON
+            gripper_id = parse_gripper_cal_dir_name(gripper_cal_path.parent.name)
+            assert gripper_id is not None, f"Cannot parse gripper_id from {gripper_cal_path.parent.name}"
+
             gripper_range_data = json.load(gripper_cal_path.open('r'))
-            gripper_id = gripper_range_data['gripper_id']
             max_width = gripper_range_data['max_width']
             min_width = gripper_range_data['min_width']
             gripper_id_range_map[gripper_id] = (min_width, max_width)
-            
+
             gripper_cal_data = {
                 'aruco_measured_width': [min_width, max_width],
                 'aruco_actual_width': [min_width, max_width]
@@ -197,10 +266,15 @@ def main(input, output, tcp_offset, tx_slam_tag,
                         exit(1)
             duration_sec = float(n_frames / fps)
             end_timestamp = start_timestamp + duration_sec
-            
+
+            # Parse episode and gripper id from directory name
+            episode_num, gripper_id = parse_demo_dir_name(video_dir.name)
+
             rows.append({
                 'video_dir': video_dir,
                 'camera_serial': cam_serial,
+                'episode_num': episode_num,
+                'gripper_id': gripper_id,
                 'start_date': start_date,
                 'n_frames': n_frames,
                 'fps': fps,
@@ -215,143 +289,69 @@ def main(input, output, tcp_offset, tx_slam_tag,
 
 
     # %% stage 2
-    # match videos into demos
+    # match videos into demos by episode_num
     # output:
     # demo_data_list = {
     #     "video_idxs": [int],
     #     # calculating start/end frame requires gripper info, defer to later stage
     #     "start_timestamp": float,
-    #     "end_timestamp": float
+    #     "end_timestamp": float,
+    #     "episode_num": int
     # }
     # map serial to count
     serial_count = video_meta_df['camera_serial'].value_counts()
     print("Found following cameras:")
     print(serial_count)
     n_cameras = len(serial_count)
-    
-    events = list()
-    for vid_idx, row in video_meta_df.iterrows():
-        events.append({
-            'vid_idx': vid_idx,
-            'camera_serial': row['camera_serial'],
-            't': row['start_timestamp'],
-            'is_start': True
-        })
-        events.append({
-            'vid_idx': vid_idx,
-            'camera_serial': row['camera_serial'],
-            't': row['end_timestamp'],
-            'is_start': False
-        })
-    events = sorted(events, key=lambda x: x['t'])
-    
+
+    # Group by episode_num instead of time overlap
     demo_data_list = list()
-    on_videos = set()
-    on_cameras = set()
     used_videos = set()
-    t_demo_start = None
-    for i, event in enumerate(events):
-        # update state based on event
-        if event['is_start']:
-            on_videos.add(event['vid_idx'])
-            on_cameras.add(event['camera_serial'])
-        else:
-            on_videos.remove(event['vid_idx'])
-            on_cameras.remove(event['camera_serial'])
-        assert len(on_videos) == len(on_cameras)
-        
-        if len(on_cameras) == n_cameras:
-            # start demo episode where all cameras are recording
-            t_demo_start = event['t']
-        elif t_demo_start is not None:
-            # demo already started, but one camera stopped
-            # stopping episode
-            assert not event['is_start']
-            
-            t_start = t_demo_start
-            t_end = event['t']
-            
-            # undo state update to get full set of videos
-            demo_vid_idxs = set(on_videos)
-            demo_vid_idxs.add(event['vid_idx'])
-            used_videos.update(demo_vid_idxs)
-            
-            demo_data_list.append({
-                "video_idxs": sorted(demo_vid_idxs),
-                "start_timestamp": t_start,
-                "end_timestamp": t_end
-            })
-            t_demo_start = None
+    episode_groups = video_meta_df.groupby('episode_num')
+
+    for episode_num, episode_df in episode_groups:
+        if episode_num is None:
+            for vid_idx in episode_df.index:
+                print(f"Warning: video {video_meta_df.loc[vid_idx]['video_dir'].name} has no episode_num")
+            continue
+
+        video_idxs = list(episode_df.index)
+        t_start = episode_df['start_timestamp'].max()
+        t_end = episode_df['end_timestamp'].min()
+
+        if t_end <= t_start:
+            print(f"Warning: episode {episode_num} has no valid time overlap")
+            continue
+
+        used_videos.update(video_idxs)
+        demo_data_list.append({
+            "video_idxs": sorted(video_idxs),
+            "start_timestamp": t_start,
+            "end_timestamp": t_end,
+            "episode_num": episode_num
+        })
+
+    demo_data_list = sorted(demo_data_list, key=lambda x: x['episode_num'])
+
     unused_videos = set(video_meta_df.index) - used_videos
     for vid_idx in unused_videos:
         print(f"Warning: video {video_meta_df.loc[vid_idx]['video_dir'].name} unused in any demo")
 
     # %% stage 3
-    # identify gripper id (hardware) using aruco
-    # output: 
+    # Use gripper_id parsed from directory name (already in video_meta_df['gripper_id'])
+    # output:
     # add video_meta_df['gripper_hardware_id'] column
     # cam_serial_gripper_hardware_id_map Dict[str, int]
-    finger_tag_det_th = 0.5
-    vid_idx_gripper_hardware_id_map = dict()
-    cam_serial_gripper_ids_map = collections.defaultdict(list)
-    for vid_idx, row in video_meta_df.iterrows():
-        video_dir = row['video_dir']
-        pkl_path = video_dir.joinpath('tag_detection.pkl')
-        if not pkl_path.is_file():
-            vid_idx_gripper_hardware_id_map[vid_idx] = -1
-            continue
-        tag_data = pickle.load(pkl_path.open('rb'))
-        n_frames = len(tag_data)
-        tag_counts = collections.defaultdict(lambda: 0)
-        for frame in tag_data:
-            for key in frame['tag_dict'].keys():
-                tag_counts[key] += 1
-        tag_stats = collections.defaultdict(lambda: 0.0)
-        for k, v in tag_counts.items():
-            tag_stats[k] = v / n_frames
-            
-        # classify gripper by tag
-        # tag 0, 1 are reserved for gripper 0
-        # tag 6, 7 are reserved for gripper 1
-        max_tag_id = np.max(list(tag_stats.keys()))
-        tag_per_gripper = 6
-        max_gripper_id = max_tag_id // tag_per_gripper
-        
-        gripper_prob_map = dict()
-        for gripper_id in range(max_gripper_id+1):
-            left_id = gripper_id * tag_per_gripper
-            right_id = left_id + 1
-            left_prob = tag_stats[left_id]
-            right_prob = tag_stats[right_id]
-            gripper_prob = min(left_prob, right_prob)
-            if gripper_prob <= 0:
-                continue
-            gripper_prob_map[gripper_id] = gripper_prob
-        
-        gripper_id_by_tag = -1
-        if len(gripper_prob_map) > 0:
-            gripper_probs = sorted(gripper_prob_map.items(), key=lambda x:x[-1])
-            gripper_id = gripper_probs[-1][0]
-            gripper_prob = gripper_probs[-1][1]
-            if gripper_prob >= finger_tag_det_th:
-                gripper_id_by_tag = gripper_id
 
-        cam_serial_gripper_ids_map[row['camera_serial']].append(gripper_id_by_tag)
-        vid_idx_gripper_hardware_id_map[vid_idx] = gripper_id_by_tag
-    
-    # add column to video_meta_df for gripper hardware id
-    series = pd.Series(
-        data=list(vid_idx_gripper_hardware_id_map.values()), 
-        index=list(vid_idx_gripper_hardware_id_map.keys()))
-    video_meta_df['gripper_hardware_id'] = series
-    
+    # gripper_id was already parsed from directory name in Stage 1
+    # Just copy it to gripper_hardware_id column
+    video_meta_df['gripper_hardware_id'] = video_meta_df['gripper_id']
+
+    # Build cam_serial_gripper_hardware_id_map from parsed gripper_id
     cam_serial_gripper_hardware_id_map = dict()
-    for cam_serial, gripper_ids in cam_serial_gripper_ids_map.items():
-        counter = collections.Counter(gripper_ids)
-        if len(counter) != 1:
-            print(f"warning: multiple gripper ids {counter} detected for camera serial {cam_serial}")
-        gripper_id = counter.most_common()[0][0]
-        cam_serial_gripper_hardware_id_map[cam_serial] = gripper_id 
+    for vid_idx, row in video_meta_df.iterrows():
+        if row['gripper_id'] is not None:
+            cam_serial_gripper_hardware_id_map[row['camera_serial']] = row['gripper_id'] 
         
     # %% stage 4
     # disambiguiate gripper left/right
@@ -362,9 +362,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
     # cam_serial_cam_idx_map Dict[str,int]
     # video_meta_df add column "camera_idx" and "camera_idx_from_episode"
     
-    n_gripper_cams = (np.array(list(
-        cam_serial_gripper_hardware_id_map.values())
-        ) >= 0).sum()
+    n_gripper_cams = sum(1 for v in cam_serial_gripper_hardware_id_map.values() if v is not None)
     
     if n_gripper_cams <= 0:
         # no gripper camera
@@ -374,7 +372,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
     grip_cam_serials = list()
     other_cam_serials = list()
     for cs, gi in cam_serial_gripper_hardware_id_map.items():
-        if gi >= 0:
+        if gi is not None:
             grip_cam_serials.append(cs)
         else:
             other_cam_serials.append(cs)
@@ -399,8 +397,8 @@ def main(input, output, tcp_offset, tx_slam_tag,
 
         for vid_idx in video_idxs:
             row = video_meta_df.loc[vid_idx]
-            if row.gripper_hardware_id < 0:
-                # not gripper camera
+            if row.gripper_hardware_id is None:
+                # not gripper camera (e.g., mapping)
                 cam_serial = row['camera_serial']
                 if cam_serial in cam_serial_cam_idx_map:
                     vid_idx_cam_idx_map[vid_idx] = cam_serial_cam_idx_map[cam_serial]
@@ -580,6 +578,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
         all_cam_poses = list()
         all_gripper_widths = list()
         all_is_valid = list()
+        all_uvc_info = dict()  # Store UVC info by gripper_id
         
         for cam_idx, row in demo_video_meta_df.iterrows():
             if cam_idx >= n_gripper_cams:
@@ -655,7 +654,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
 
             # get gripper action
             ghi = row['gripper_hardware_id']
-            if ghi < 0:
+            if ghi is None:
                 print(f"Skipping {video_dir.name}, invalid gripper hardware id {ghi}")
                 dropped_camera_count[row['camera_serial']] += 1
                 continue
@@ -674,18 +673,16 @@ def main(input, output, tcp_offset, tx_slam_tag,
 
             min_width, max_width = gripper_id_range_map[ghi]
 
-            # load motor data if exists
+            # load motor data if exists (JSONL format)
             motor_widths = None
             motor_ts = None
-            motor_path = video_dir.joinpath('motor_data.npz')
+            motor_ts_origin = None  # Save original system time start point
+            motor_path = video_dir.joinpath('motor_data.jsonl')
             if motor_path.is_file():
-                motor_data = np.load(motor_path)
-                motor_cols = [str(c) for c in motor_data['columns']]
-                motor_idx = {c: i for i, c in enumerate(motor_cols)}
-                motor_ts = motor_data['data'][:, motor_idx['ts']].astype(float)
-                motor_ts = motor_ts - motor_ts[0] # use relative time
-                motor_pos = motor_data['data'][:, motor_idx['pos']].astype(float)
-                
+                motor_ts, motor_pos = load_motor_jsonl(motor_path)
+                motor_ts_origin = motor_ts[0]  # Save absolute time start point
+                motor_ts = motor_ts - motor_ts_origin  # Convert to relative time
+
                 # process motor data
                 mask_cal = motor_ts <= motor_ts[0] + 0.5
                 close_pos = float(np.median(motor_pos[mask_cal]))
@@ -693,9 +690,9 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 max_idx = np.argmax(np.abs(diff))
                 motor_span_rad = abs(diff[max_idx])
                 sign = 1.0 if diff[max_idx] > 0 else -1.0
-                
+
                 physical_span = max_width - min_width
-                
+
                 radian_to_meter_ratio = physical_span / motor_span_rad
                 motor_widths = np.clip(sign * (motor_pos - close_pos) * radian_to_meter_ratio, 0.0, physical_span)
             else:
@@ -766,6 +763,29 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 # update final gripper widths
                 this_gripper_widths = this_motor_widths
 
+            # Load UVC info and calculate aligned frames
+            uvc_info = None
+            uvc_frame_indices = None
+
+            uvc_info = get_uvc_info(video_dir)
+
+            if uvc_info is not None:
+                # UVC fps validation
+                gopro_fps = float(row['fps'])
+                uvc_fps = uvc_info['fps']
+                fps_diff = abs(uvc_fps - gopro_fps) / gopro_fps
+                if fps_diff > 0.005:
+                    raise ValueError(f"UVC fps mismatch in {video_dir.name}")
+
+                if motor_ts_origin is None:
+                    raise ValueError(f"Found UVC data but missing motor data in {video_dir.name}")
+
+                # Calculate UVC frame indices corresponding to GoPro frames
+                system_timestamps = motor_ts_origin + video_timestamps - t_offset
+                uvc_ts = uvc_info['timestamps']
+                uvc_frame_indices = np.searchsorted(uvc_ts, system_timestamps)
+                uvc_frame_indices = np.clip(uvc_frame_indices, 0, len(uvc_ts) - 1)
+
             # transform to tcp frame
             tx_tag_tcp = tx_tag_cam @ tx_cam_tcp
             pose_tag_tcp = mat_to_pose(tx_tag_tcp)
@@ -777,6 +797,14 @@ def main(input, output, tcp_offset, tx_slam_tag,
             all_cam_poses.append(pose_tag_tcp)
             all_gripper_widths.append(this_gripper_widths)
             all_is_valid.append(is_step_valid)
+
+            # Store UVC info by gripper_id for later camera list building
+            if uvc_info is not None and uvc_frame_indices is not None:
+                all_uvc_info[ghi] = {
+                    'uvc_info': uvc_info,
+                    'uvc_frame_indices': uvc_frame_indices,
+                    'video_dir': video_dir
+                }
 
         if len(all_cam_poses) != n_gripper_cams:
             print(f"Skipped demo {demo_idx}.")
@@ -823,7 +851,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
             for cam_idx, row in demo_video_meta_df.iterrows():
                 if cam_idx < n_gripper_cams:
                     pose_tag_tcp = all_cam_poses[cam_idx][start:end]
-                    
+
                     # gripper cam
                     grippers.append({
                         "tcp_pose": pose_tag_tcp,
@@ -836,8 +864,26 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 vid_start_frame = cam_start_frame_idxs[cam_idx]
                 cameras.append({
                     "video_path": str(video_dir.joinpath('raw_video.mp4').relative_to(video_dir.parent)),
-                    "video_start_end": (start+vid_start_frame, end+vid_start_frame)
+                    "video_start_end": (start+vid_start_frame, end+vid_start_frame),
+                    "is_uvc": False
                 })
+
+                # Add UVC camera for this gripper
+                gripper_id = row['gripper_id']
+                if gripper_id is not None and gripper_id in all_uvc_info:
+                    uvc_data = all_uvc_info[gripper_id]
+                    uvc_info = uvc_data['uvc_info']
+                    uvc_frame_indices = uvc_data['uvc_frame_indices']
+
+                    uvc_start_frame = int(uvc_frame_indices[start])
+                    uvc_end_frame = int(uvc_frame_indices[end - 1]) + 1
+
+                    cameras.append({
+                        "video_path": str(uvc_info['video_path'].relative_to(video_dir.parent)),
+                        "video_start_end": (uvc_start_frame, uvc_end_frame),
+                        "is_uvc": True,
+                        "gripper_idx": gripper_id
+                    })
             
             all_plans.append({
                 "episode_timestamps": demo_timestamps[start:end],

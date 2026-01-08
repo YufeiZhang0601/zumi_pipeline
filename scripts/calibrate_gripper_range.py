@@ -17,46 +17,51 @@ from umi.common.cv_util import get_gripper_width
 @click.command()
 @click.option('-i', '--input', required=True, help='Tag detection pkl')
 @click.option('-o', '--output', required=True, help='output json')
+@click.option('-g', '--gripper_id', type=int, default=None, help='Gripper hardware ID (if not provided, infer from tags)')
 @click.option('-t', '--tag_det_threshold', type=float, default=0.5)
 @click.option('-nz', '--nominal_z', type=float, default=0.034, help="nominal Z value for gripper finger tag")
-def main(input, output, tag_det_threshold, nominal_z):
+def main(input, output, gripper_id, tag_det_threshold, nominal_z):
     tag_detection_results = pickle.load(open(input, 'rb'))
-    
-    # identify gripper hardware id
-    n_frames = len(tag_detection_results)
-    tag_counts = collections.defaultdict(lambda: 0)
-    for frame in tag_detection_results:
-        for key in frame['tag_dict'].keys():
-            tag_counts[key] += 1
-    tag_stats = collections.defaultdict(lambda: 0.0)
-    for k, v in tag_counts.items():
-        tag_stats[k] = v / n_frames
-    
-    max_tag_id = np.max(list(tag_stats.keys()))
     tag_per_gripper = 6
-    max_gripper_id = max_tag_id // tag_per_gripper
-    
-    gripper_prob_map = dict()
-    for gripper_id in range(max_gripper_id+1):
-        left_id = gripper_id * tag_per_gripper
-        right_id = left_id + 1
-        left_prob = tag_stats[left_id]
-        right_prob = tag_stats[right_id]
-        gripper_prob = min(left_prob, right_prob)
-        if gripper_prob <= 0:
-            continue
-        gripper_prob_map[gripper_id] = gripper_prob
-    if len(gripper_prob_map) == 0:
-        print("No grippers detected!")
-        exit(1)
-    
-    gripper_probs = sorted(gripper_prob_map.items(), key=lambda x:x[1])
-    gripper_id = gripper_probs[-1][0]
-    gripper_prob = gripper_probs[-1][1]
-    print(f"Detected gripper id: {gripper_id} with probability {gripper_prob}")
-    if gripper_prob < tag_det_threshold:
-        print(f"Detection rate {gripper_prob} < {tag_det_threshold} threshold.")
-        exit(1)
+
+    # 如果提供了 gripper_id，直接使用；否则从 tag detection 推断
+    if gripper_id is None:
+        # 原有的 tag detection 推断逻辑
+        n_frames = len(tag_detection_results)
+        tag_counts = collections.defaultdict(lambda: 0)
+        for frame in tag_detection_results:
+            for key in frame['tag_dict'].keys():
+                tag_counts[key] += 1
+        tag_stats = collections.defaultdict(lambda: 0.0)
+        for k, v in tag_counts.items():
+            tag_stats[k] = v / n_frames
+
+        max_tag_id = np.max(list(tag_stats.keys()))
+        max_gripper_id = max_tag_id // tag_per_gripper
+
+        gripper_prob_map = dict()
+        for gid in range(max_gripper_id+1):
+            left_id = gid * tag_per_gripper
+            right_id = left_id + 1
+            left_prob = tag_stats[left_id]
+            right_prob = tag_stats[right_id]
+            gripper_prob = min(left_prob, right_prob)
+            if gripper_prob <= 0:
+                continue
+            gripper_prob_map[gid] = gripper_prob
+        if len(gripper_prob_map) == 0:
+            print("No grippers detected!")
+            exit(1)
+
+        gripper_probs = sorted(gripper_prob_map.items(), key=lambda x:x[1])
+        gripper_id = gripper_probs[-1][0]
+        gripper_prob = gripper_probs[-1][1]
+        print(f"Detected gripper id: {gripper_id} with probability {gripper_prob}")
+        if gripper_prob < tag_det_threshold:
+            print(f"Detection rate {gripper_prob} < {tag_det_threshold} threshold.")
+            exit(1)
+    else:
+        print(f"Using provided gripper_id: {gripper_id}")
         
     # run calibration
     left_id = gripper_id * tag_per_gripper
