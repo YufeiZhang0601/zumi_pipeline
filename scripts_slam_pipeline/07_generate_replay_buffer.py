@@ -140,7 +140,8 @@ def main(input, output, out_res, out_fov, compression_level,
                     'camera_idx': cam_id,
                     'frame_start': video_start,
                     'frame_end': video_end,
-                    'buffer_start': buffer_start
+                    'buffer_start': buffer_start,
+                    'is_uvc': camera.get('is_uvc', False)
                 })
             buffer_start += n_frames
         
@@ -166,13 +167,24 @@ def main(input, output, out_res, out_fov, compression_level,
             dtype=np.uint8
         )
 
-    def video_to_zarr(replay_buffer, mp4_path, tasks):
-        pkl_path = os.path.join(os.path.dirname(mp4_path), 'tag_detection.pkl')
-        tag_detection_results = pickle.load(open(pkl_path, 'rb'))
+    def video_to_zarr(replay_buffer, mp4_path, tasks, is_uvc=False):
+        # Get this video's resolution
+        with av.open(mp4_path) as container:
+            in_stream = container.streams.video[0]
+            this_ih, this_iw = in_stream.height, in_stream.width
+
+        # Create resize transform for this video's resolution
         resize_tf = get_image_transform(
-            in_res=(iw, ih),
+            in_res=(this_iw, this_ih),
             out_res=out_res
         )
+
+        # Only load tag detection for non-UVC cameras
+        tag_detection_results = None
+        if not is_uvc:
+            pkl_path = os.path.join(os.path.dirname(mp4_path), 'tag_detection.pkl')
+            if os.path.exists(pkl_path):
+                tag_detection_results = pickle.load(open(pkl_path, 'rb'))
         tasks = sorted(tasks, key=lambda x: x['frame_start'])
         camera_idx = None
         for task in tasks:
@@ -213,17 +225,18 @@ def main(input, output, out_res, out_fov, compression_level,
                     # do current task
                     img = frame.to_ndarray(format='rgb24')
 
-                    # inpaint tags
-                    this_det = tag_detection_results[frame_idx]
-                    all_corners = [x['corners'] for x in this_det['tag_dict'].values()]
-                    for corners in all_corners:
-                        img = inpaint_tag(img, corners)
+                    # inpaint tags (only for non-UVC cameras with tag detection)
+                    if tag_detection_results is not None:
+                        this_det = tag_detection_results[frame_idx]
+                        all_corners = [x['corners'] for x in this_det['tag_dict'].values()]
+                        for corners in all_corners:
+                            img = inpaint_tag(img, corners)
                         
                     # mask out gripper
                     # img = draw_predefined_mask(img, color=(0,0,0), 
                         # mirror=no_mirror, gripper=True, finger=False)
-                    # resize
-                    if fisheye_converter is None:
+                    # UVC cameras don't need fisheye correction
+                    if is_uvc or fisheye_converter is None:
                         img = resize_tf(img)
                     else:
                         img = fisheye_converter.forward(img)
@@ -253,8 +266,10 @@ def main(input, output, out_res, out_fov, compression_level,
                         return_when=concurrent.futures.FIRST_COMPLETED)
                     pbar.update(len(completed))
 
-                futures.add(executor.submit(video_to_zarr, 
-                    out_replay_buffer, mp4_path, tasks))
+                # Check if this is a UVC camera from the task info
+                is_uvc = tasks[0].get('is_uvc', False) if tasks else False
+                futures.add(executor.submit(video_to_zarr,
+                    out_replay_buffer, mp4_path, tasks, is_uvc))
 
             completed, futures = concurrent.futures.wait(futures)
             pbar.update(len(completed))

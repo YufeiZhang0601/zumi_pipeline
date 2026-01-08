@@ -35,7 +35,3 @@ data/*
 *.json
 .env
 debug_data/*
-*.pdf
-*.PDF
-*.MP4
-.workflow/*

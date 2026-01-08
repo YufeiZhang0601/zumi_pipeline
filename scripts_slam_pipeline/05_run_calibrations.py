@@ -13,6 +13,14 @@ os.chdir(ROOT_DIR)
 import pathlib
 import click
 import subprocess
+import re
+
+def parse_gripper_id_from_dir(dir_name):
+    """Parse gripper id from directory name like 'gripper_calibration_gp00'. Raises error if not found."""
+    match = re.search(r'gp(\d+)', dir_name)
+    if not match:
+        raise ValueError(f"Directory name {dir_name} does not contain 'gpXX' pattern")
+    return int(match.group(1))
 
 # %%
 @click.command()
@@ -54,10 +62,15 @@ def main(session_dir):
             gripper_range_path = gripper_dir.joinpath('gripper_range.json')
             tag_path = gripper_dir.joinpath('tag_detection.pkl')
             assert tag_path.is_file()
+
+            # 从目录名解析 gripper_id
+            gripper_id = parse_gripper_id_from_dir(gripper_dir.name)
+
             cmd = [
                 sys.executable, str(script_path),
                 '--input', str(tag_path),
-                '--output', str(gripper_range_path)
+                '--output', str(gripper_range_path),
+                '--gripper_id', str(gripper_id)
             ]
             subprocess.run(cmd)
 
