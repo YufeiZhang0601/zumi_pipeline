@@ -143,11 +143,17 @@ def main(session_dir):
             # Motor 和 UVC 使用 gripper 前缀（避免重复处理）
             if gripper_prefix and gripper_prefix not in gripper_prefix_to_motor_data_path:
                 # Motor data (JSONL format)
-                motor_data_path = session.joinpath(gripper_prefix + "_motor.jsonl")
-                if motor_data_path.exists():
-                    out_motor_data_path = input_dir.joinpath(gripper_prefix + "_motor.jsonl")
+                # Support both formats:
+                #   - {gripper_prefix}_motor.jsonl (standard)
+                #   - {gripper_prefix}_{gopro_id}_motor.jsonl (legacy with gopro ID)
+                motor_candidates = sorted(session.glob(f"{gripper_prefix}*_motor.jsonl"))
+                if motor_candidates:
+                    motor_data_path = motor_candidates[0]
+                    out_motor_data_path = input_dir.joinpath(motor_data_path.name)
                     shutil.move(motor_data_path, out_motor_data_path)
                     gripper_prefix_to_motor_data_path[gripper_prefix] = out_motor_data_path
+                else:
+                    print(f"Warning: Motor data not found for {gripper_prefix}")
 
                 # UVC files
                 uvc_video_path = session.joinpath(gripper_prefix + "_uvc.MP4")
