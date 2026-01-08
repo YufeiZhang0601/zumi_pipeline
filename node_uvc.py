@@ -15,7 +15,7 @@ import cv2
 
 from umi.real_world.uvc_camera import UvcCamera
 from umi.real_world.video_recorder import VideoRecorder
-from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, UVC_CONF
+from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, UVC_CONF, get_default_gripper_id
 from zumi_core import NodeHTTPService
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
@@ -141,14 +141,15 @@ class UvcNode(NodeHTTPService):
     RECOVERY_BACKOFF_BASE = 2.0
     RECOVERY_BACKOFF_MAX = 30.0
 
-    def __init__(self, name: str = "uvc_node"):
+    def __init__(self, gripper_id: str = None):
+        self.gripper_id = gripper_id or get_default_gripper_id()
         self.shm_manager: Optional[SharedMemoryManager] = None
         self.camera: Optional[UvcCamera] = None
         self.sidecar_thread: Optional[threading.Thread] = None
         self.sidecar_stop: Optional[threading.Event] = None
         self.current_video: Optional[Path] = None
         self.current_meta: Optional[Path] = None
-        super().__init__(name=name, host=HTTP_CONF.UVC_HOST, port=HTTP_CONF.UVC_PORT)
+        super().__init__(name=f"uvc_{self.gripper_id}", host=HTTP_CONF.UVC_HOST, port=HTTP_CONF.UVC_PORT)
 
     # Lifecycle ---------------------------------------------------------------
     def on_init(self):
@@ -330,8 +331,8 @@ class UvcNode(NodeHTTPService):
         ep_tag = f"ep{int(ep_val):03d}"
         run_dir = STORAGE_CONF.DATA_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        video_path = run_dir / f"{run_id}_{ep_tag}_uvc.MP4"
-        meta_path = run_dir / f"{run_id}_{ep_tag}_uvc.jsonl"
+        video_path = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_uvc.MP4"
+        meta_path = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_uvc.jsonl"
         return video_path, meta_path
 
     def _start_sidecar(self, meta_path):
@@ -442,9 +443,9 @@ class UvcNode(NodeHTTPService):
         ep_tag = f"ep{int(episode):03d}" if episode is not None else None
         patterns = []
         if ep_tag:
-            patterns = [f"{run_id}_{ep_tag}_uvc.MP4", f"{run_id}_{ep_tag}_uvc.jsonl"]
+            patterns = [f"{run_id}_{ep_tag}_{self.gripper_id}_uvc.MP4", f"{run_id}_{ep_tag}_{self.gripper_id}_uvc.jsonl"]
         else:
-            patterns = [f"{run_id}_*_uvc.MP4", f"{run_id}_*_uvc.jsonl"]
+            patterns = [f"{run_id}_*_{self.gripper_id}_uvc.MP4", f"{run_id}_*_{self.gripper_id}_uvc.jsonl"]
 
         run_dir = STORAGE_CONF.DATA_DIR / run_id
         for pattern in patterns:
@@ -477,17 +478,18 @@ class UvcNode(NodeHTTPService):
         }
 
 
-def validate(run_id: str, episode: int):
+def validate(run_id: str, episode: int, gripper_id: str = None):
     """
     Basic UVC validator: check video + sidecar presence and rough duration match.
     """
     from validator import ValidationResult  # Local import to avoid cycles
     from validator import check_video_decoding, get_video_duration
 
+    gripper_id = gripper_id or get_default_gripper_id()
     ep_tag = f"ep{int(episode):03d}"
     run_dir = STORAGE_CONF.DATA_DIR / run_id
-    video_path = run_dir / f"{run_id}_{ep_tag}_uvc.MP4"
-    sidecar_path = run_dir / f"{run_id}_{ep_tag}_uvc.jsonl"
+    video_path = run_dir / f"{run_id}_{ep_tag}_{gripper_id}_uvc.MP4"
+    sidecar_path = run_dir / f"{run_id}_{ep_tag}_{gripper_id}_uvc.jsonl"
 
     if not video_path.exists():
         return ValidationResult(False, "video_missing", f"UVC video missing: {video_path.name}")
@@ -520,5 +522,11 @@ def validate(run_id: str, episode: int):
 
 
 if __name__ == "__main__":
-    node = UvcNode()
-    node.start()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gripper-id", default=None, help="Gripper ID (e.g., gp00)")
+    parser.add_argument("--port", type=int, default=HTTP_CONF.UVC_PORT, help="HTTP port")
+    args = parser.parse_args()
+
+    node = UvcNode(gripper_id=args.gripper_id)
+    node.run(port=args.port)

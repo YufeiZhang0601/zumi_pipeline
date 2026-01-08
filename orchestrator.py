@@ -17,7 +17,7 @@ import click
 import requests
 import zmq
 
-from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, ZMQ_CONF
+from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, ZMQ_CONF, get_default_gripper_id
 from validator import validate, ValidationResult
 
 
@@ -458,23 +458,26 @@ def save_validation_result(run_id: str, episode: int, result: ValidationResult):
 
 def _get_gopro_client(ctx: OrchestratorContext) -> NodeClient:
     """Get the GoPro node client."""
-    return next(c for c in ctx.clients if c.name == "go_pro_node")
+    gripper_id = get_default_gripper_id()
+    return next(c for c in ctx.clients if c.name == f"gopro_{gripper_id}")
 
 
 def _wait_download_complete(ctx: OrchestratorContext, timeout: int = 300) -> bool:
     """Poll GoPro status until download complete."""
+    gripper_id = get_default_gripper_id()
+    gopro_node_name = f"gopro_{gripper_id}"
     start = time.time()
 
     # First, wait for download to start (is_downloading becomes True)
     while time.time() - start < 10:
-        info = ctx.nodes.get("go_pro_node", {})
+        info = ctx.nodes.get(gopro_node_name, {})
         if info.get("is_downloading", False):
             break
         time.sleep(0.5)
 
     # Then wait for download to complete (is_downloading becomes False)
     while time.time() - start < timeout:
-        info = ctx.nodes.get("go_pro_node", {})
+        info = ctx.nodes.get(gopro_node_name, {})
         if not info.get("is_downloading", False):
             return True
         time.sleep(1)
@@ -948,10 +951,11 @@ def handle_key(key: str, state: OrchestratorState, ctx: OrchestratorContext) -> 
     help="Validation mode indicator for UI.",
 )
 def main(delay, run_id, tag, validation_mode):
+    gripper_id = get_default_gripper_id()
     clients = [
-        NodeClient("go_pro_node", HTTP_CONF.GOPRO_URL),
-        NodeClient("DM3510", HTTP_CONF.MOTOR_URL),
-        NodeClient("uvc_node", HTTP_CONF.UVC_URL),
+        NodeClient(f"gopro_{gripper_id}", HTTP_CONF.GOPRO_URL),
+        NodeClient(f"motor_{gripper_id}", HTTP_CONF.MOTOR_URL),
+        NodeClient(f"uvc_{gripper_id}", HTTP_CONF.UVC_URL),
     ]
     expected_names = [c.name for c in clients]
 

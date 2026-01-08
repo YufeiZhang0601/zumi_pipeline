@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from zumi_core import NodeHTTPService
-from zumi_config import HTTP_CONF, MOTOR_CONF, NodeStatus, STORAGE_CONF
+from zumi_config import HTTP_CONF, MOTOR_CONF, NodeStatus, STORAGE_CONF, get_default_gripper_id, get_gripper_mapping
 from zumi_util import RateLimiter
 from motor_mock import MockMotorDriver
 
@@ -77,11 +77,12 @@ class MotorRecorder:
 
 
 class MotorNode(NodeHTTPService):
-    def __init__(self, name: str = "DM3510"):
+    def __init__(self, gripper_id: str = None):
+        self.gripper_id = gripper_id or get_default_gripper_id()
         self.driver = None
         self.recorder = None
         self.current_path: Optional[Path] = None
-        super().__init__(name=name, host=HTTP_CONF.MOTOR_HOST, port=HTTP_CONF.MOTOR_PORT)
+        super().__init__(name=f"motor_{self.gripper_id}", host=HTTP_CONF.MOTOR_HOST, port=HTTP_CONF.MOTOR_PORT)
 
     def on_init(self):
         self.driver = _build_driver()
@@ -103,7 +104,7 @@ class MotorNode(NodeHTTPService):
         ep_tag = f"ep{int(ep_val):03d}"
         run_dir = STORAGE_CONF.DATA_DIR / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        return run_dir / f"{run_id}_{ep_tag}_motor.jsonl"
+        return run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor.jsonl"
 
     def on_start_recording(self, run_id, episode=None, start_time=None):
         path = self._episode_path(run_id, episode)
@@ -153,13 +154,14 @@ class MotorNode(NodeHTTPService):
         return {"motor_file": str(self.current_path) if self.current_path else None}
 
 
-def validate(run_id: str, episode: Optional[int]):
+def validate(run_id: str, episode: Optional[int], gripper_id: str = None):
     from validator import ValidationResult
 
+    gripper_id = gripper_id or get_default_gripper_id()
     ep_val = episode if episode is not None else 1
     ep_tag = f"ep{int(ep_val):03d}"
     run_dir = STORAGE_CONF.DATA_DIR / run_id
-    path = run_dir / f"{run_id}_{ep_tag}_motor.jsonl"
+    path = run_dir / f"{run_id}_{ep_tag}_{gripper_id}_motor.jsonl"
 
     if not path.exists():
         return ValidationResult(False, "motor_missing", f"Motor data missing: {path.name}")
@@ -202,5 +204,11 @@ def validate(run_id: str, episode: Optional[int]):
 
 
 if __name__ == "__main__":
-    node = MotorNode()
-    node.start()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gripper-id", default=None, help="Gripper ID (e.g., gp00)")
+    parser.add_argument("--port", type=int, default=HTTP_CONF.MOTOR_PORT, help="HTTP port")
+    args = parser.parse_args()
+
+    node = MotorNode(gripper_id=args.gripper_id)
+    node.run(port=args.port)

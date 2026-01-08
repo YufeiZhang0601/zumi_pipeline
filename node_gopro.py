@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from zumi_config import GOPRO_CONF, HTTP_CONF, NodeStatus, STORAGE_CONF
+from zumi_config import GOPRO_CONF, HTTP_CONF, NodeStatus, STORAGE_CONF, get_default_gripper_id, get_gripper_mapping
 from zumi_core import NodeHTTPService
 from fastapi import Body, HTTPException
 
@@ -147,14 +147,15 @@ class GoProNode(NodeHTTPService):
     RECOVERY_BACKOFF_BASE = 3.0
     RECOVERY_BACKOFF_MAX = 30.0
 
-    def __init__(self, name="go_pro_node", mute_on_start=True):
+    def __init__(self, gripper_id: str = None, mute_on_start=True):
+        self.gripper_id = gripper_id or get_default_gripper_id()
         self.mute_on_start = mute_on_start
         self.current_run_id = None
         self.current_episode = None
         self.is_downloading = False
         self.download_history = {}  # {(run_id, episode): (folder, filename)}
         self._download_task = None  # (run_id, episode, folder, filename) for current download
-        super().__init__(name, host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
+        super().__init__(name=f"gopro_{self.gripper_id}", host=HTTP_CONF.GOPRO_HOST, port=HTTP_CONF.GOPRO_PORT)
         self._remove_default_download_route()
         self._setup_gopro_routes()
 
@@ -256,7 +257,7 @@ class GoProNode(NodeHTTPService):
         """Remove existing downloaded files for a re-download."""
         ep_tag = f"ep{int(episode):03d}"
         run_dir = STORAGE_CONF.DATA_DIR / run_id
-        for path in run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"):
+        for path in run_dir.glob(f"{run_id}_{ep_tag}_{self.gripper_id}_*.MP4"):
             try:
                 path.unlink()
                 logger.info(f"[Redownload] Deleted: {path}")
@@ -307,9 +308,9 @@ class GoProNode(NodeHTTPService):
 
     def _download_one(self, run_id, episode, folder, filename):
         """Download a single video file."""
-        ep_val = episode or 1
+        ep_val = episode if episode is not None else 1
         ep_tag = f"ep{int(ep_val):03d}"
-        save_name = f"{run_id}_{ep_tag}_{filename}"
+        save_name = f"{run_id}_{ep_tag}_{self.gripper_id}_{filename}"
 
         # Save to run_id directory
         run_dir = STORAGE_CONF.DATA_DIR / run_id
@@ -327,8 +328,18 @@ class GoProNode(NodeHTTPService):
 
             # Rename motor files to include gopro tag
             gopro_basename = os.path.splitext(filename)[0]
-            old_motor_npz = run_dir / f"{run_id}_{ep_tag}_motor.npz"
-            new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor.npz"
+            old_motor_jsonl = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor.jsonl"
+            new_motor_jsonl = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor.jsonl"
+            if old_motor_jsonl.exists():
+                try:
+                    old_motor_jsonl.rename(new_motor_jsonl)
+                    logger.info(f"[Sync] Renamed motor file: {old_motor_jsonl} -> {new_motor_jsonl}")
+                except Exception as exc:
+                    logger.error(f"[Sync] Failed to rename motor file: {exc}")
+
+            # Legacy: also check for old npz format
+            old_motor_npz = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor.npz"
+            new_motor_npz = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor.npz"
             if old_motor_npz.exists():
                 try:
                     old_motor_npz.rename(new_motor_npz)
@@ -336,8 +347,8 @@ class GoProNode(NodeHTTPService):
                 except Exception as exc:
                     logger.error(f"[Sync] Failed to rename motor file: {exc}")
 
-            old_motor_meta = run_dir / f"{run_id}_{ep_tag}_motor_meta.json"
-            new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{gopro_basename}_motor_meta.json"
+            old_motor_meta = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor_meta.json"
+            new_motor_meta = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor_meta.json"
             if old_motor_meta.exists():
                 try:
                     old_motor_meta.rename(new_motor_meta)
@@ -387,14 +398,14 @@ class GoProNode(NodeHTTPService):
         try:
             run_dir = STORAGE_CONF.DATA_DIR / run_id
             if episode is not None:
-                ep_val = episode or 1
+                ep_val = episode if episode is not None else 1
                 ep_tag = f"ep{int(ep_val):03d}"
                 patterns = [
-                    f"{run_id}_{ep_tag}_*.MP4",
-                    f"{run_id}_{ep_tag}_*_imu.json",
+                    f"{run_id}_{ep_tag}_{self.gripper_id}_*.MP4",
+                    f"{run_id}_{ep_tag}_{self.gripper_id}_*_imu.json",
                 ]
             else:
-                patterns = [f"{run_id}_*.MP4", f"{run_id}_*_imu.json"]
+                patterns = [f"{run_id}_*_{self.gripper_id}_*.MP4", f"{run_id}_*_{self.gripper_id}_*_imu.json"]
             for pattern in patterns:
                 for path in run_dir.glob(pattern):
                     try:
@@ -472,20 +483,25 @@ class GoProNode(NodeHTTPService):
         self.current_episode = None
 
 
-def _find_episode_video(run_id: str, episode: int) -> Optional[Path]:
+def _find_episode_video(run_id: str, episode: int, gripper_id: str = None) -> Optional[Path]:
+    gripper_id = gripper_id or get_default_gripper_id()
     ep_tag = f"ep{int(episode):03d}"
     run_dir = STORAGE_CONF.DATA_DIR / run_id
-    candidates = sorted(run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"))
+    candidates = sorted(run_dir.glob(f"{run_id}_{ep_tag}_{gripper_id}_*.MP4"))
+    if not candidates:
+        # Legacy pattern without gripper_id
+        candidates = sorted(run_dir.glob(f"{run_id}_{ep_tag}_*.MP4"))
     if not candidates:
         # Legacy pattern without ep tag
         candidates = sorted(run_dir.glob(f"{run_id}_*.MP4"))
     return candidates[0] if candidates else None
 
 
-def validate(run_id: str, episode: int):
+def validate(run_id: str, episode: int, gripper_id: str = None):
     from validator import ValidationResult, check_video_decoding, extract_imu, get_imu_start_time
 
-    video_path = _find_episode_video(run_id, episode)
+    gripper_id = gripper_id or get_default_gripper_id()
+    video_path = _find_episode_video(run_id, episode, gripper_id)
     if not video_path or not video_path.exists():
         return ValidationResult(False, "video_missing", "GoPro video not found")
     if video_path.stat().st_size < 1024:
@@ -506,8 +522,12 @@ def validate(run_id: str, episode: int):
 
 
 if __name__ == "__main__":
-    mute = True
-    if "--no-mute" in sys.argv:
-        mute = False
-    node = GoProNode(name="go_pro_node", mute_on_start=mute)
-    node.start()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gripper-id", default=None, help="Gripper ID (e.g., gp00)")
+    parser.add_argument("--port", type=int, default=HTTP_CONF.GOPRO_PORT, help="HTTP port")
+    parser.add_argument("--no-mute", action="store_true", help="Disable audio mute on start")
+    args = parser.parse_args()
+
+    node = GoProNode(gripper_id=args.gripper_id, mute_on_start=not args.no_mute)
+    node.run(port=args.port)

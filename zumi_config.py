@@ -2,6 +2,7 @@ import os
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Dict, Optional
 
 
 class NodeStatus(str, Enum):
@@ -51,6 +52,36 @@ class MotorConfig:
 class GoProConfig:
     SN: str = None  # Serial number (optional, for IP derivation)
     IP: str = None  # Direct IP (optional, auto-discover if None)
+
+
+@dataclass
+class GripperMapping:
+    """Gripper 与设备的映射关系"""
+    GRIPPER_ID: str = "gp00"           # gripper 标识符
+    MOTOR_SLAVE_ID: int = 0x16         # 对应的电机从地址
+    GOPRO_SN: str = None               # 对应的 GoPro 序列号（可选）
+    GOPRO_IP: str = None               # 对应的 GoPro IP（可选）
+    UVC_DEVICE: str = None             # 对应的 UVC 设备（可选）
+
+
+# 单臂配置（当前使用）
+GRIPPER_MAPPINGS: Dict[str, GripperMapping] = {
+    "gp00": GripperMapping(
+        GRIPPER_ID="gp00",
+        MOTOR_SLAVE_ID=0x16,
+        UVC_DEVICE="/dev/v4l/by-id/usb-DCX-250107-ZW_DECXIN-video-index0"
+    )
+}
+
+
+def get_default_gripper_id() -> str:
+    """获取默认 gripper ID（第一个配置的）"""
+    return next(iter(GRIPPER_MAPPINGS.keys()), "gp00")
+
+
+def get_gripper_mapping(gripper_id: str) -> Optional[GripperMapping]:
+    """根据 gripper_id 获取映射配置"""
+    return GRIPPER_MAPPINGS.get(gripper_id)
 
 
 @dataclass
