@@ -33,9 +33,16 @@ from umi.common.cv_util import (
     get_gripper_width
 )
 from umi.common.interpolation_util import (
-    get_gripper_calibration_interpolator, 
+    get_gripper_calibration_interpolator,
     get_interp1d,
     PoseInterpolator
+)
+from umi.common.motor_alignment import (
+    preprocess_tag_signal,
+    cross_correlate_diff_signals,
+    shift_signal,
+    find_reference_points,
+    calculate_linear_mapping
 )
 
 
@@ -707,118 +714,73 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 motor_ts_origin = motor_ts[0]  # Save absolute time start point
                 motor_ts = motor_ts - motor_ts_origin  # Convert to relative time
 
-                # ========== New Algorithm: Align First, Then Build Linear Mapping ==========
-                # This algorithm does not assume initial gripper state (closed/open).
-                # Instead, it uses Tag's min/max moments to establish motor→meter mapping.
+                # ========== Motor-Tag Alignment Algorithm ==========
+                # Uses diff cross-correlation for time alignment and stable region detection
+                # for reference point identification.
 
                 fps = float(row['fps'])
                 full_video_timestamps = np.arange(len(full_tag_detection_results), dtype=float) / fps
                 tag_widths_full = gripper_interp(full_video_timestamps)
-                tag_widths_smooth = sn.gaussian_filter1d(tag_widths_full, sigma=2)
 
-                # --- Step 1: Shape-based alignment (normalize to remove scale/offset) ---
-                # Normalize tag signal
-                tag_smooth_centered = tag_widths_smooth - np.mean(tag_widths_smooth)
-                tag_smooth_range = np.percentile(np.abs(tag_smooth_centered), 98)
-                if tag_smooth_range < 1e-6:
-                    print(f"Skipping {video_dir.name}: tag range too small ({tag_smooth_range})")
-                    continue
-                tag_smooth_normalized = tag_smooth_centered / tag_smooth_range
+                # --- Step 1: Preprocess tag signal (replaces gaussian_filter1d) ---
+                tag_widths_smooth = preprocess_tag_signal(tag_widths_full)
 
-                # Resample motor_pos to tag timestamps
+                # --- Step 2: Resample motor and apply polarity ---
+                # motor_scale_sign loaded from calibrate JSON
                 motor_pos_resampled = np.interp(full_video_timestamps, motor_ts, motor_pos)
-
-                # NEW: Apply polarity correction based on motor_scale_sign from calibration
-                # If motor_scale_sign = -1, motor position decreases when gripper opens
-                # Flip the signal to align trend with tag_width (both increase when opening)
                 motor_scale_sign = gripper_id_motor_scale_sign_map[ghi]
-                if motor_scale_sign < 0:
-                    motor_pos_for_corr = -motor_pos_resampled
-                else:
-                    motor_pos_for_corr = motor_pos_resampled
+                motor_pos_for_corr = motor_pos_resampled * (1.0 if motor_scale_sign >= 0 else -1.0)
 
-                # Normalize motor (using polarity-corrected signal)
-                motor_pos_centered = motor_pos_for_corr - np.mean(motor_pos_for_corr)
-                motor_pos_range = np.percentile(np.abs(motor_pos_centered), 98)
-                if motor_pos_range < 1e-6:
-                    print(f"Skipping {video_dir.name}: motor range too small ({motor_pos_range})")
-                    continue
-                motor_pos_normalized = motor_pos_centered / motor_pos_range
+                # --- Step 3: Time alignment using diff cross-correlation ---
+                best_lag, t_offset, max_corr = cross_correlate_diff_signals(
+                    tag_widths_smooth, motor_pos_for_corr, fps
+                )
 
-                # Cross-correlation (no abs needed - signals are already trend-aligned)
-                correlation = np.correlate(tag_smooth_normalized, motor_pos_normalized, mode='full')
-                n = len(tag_smooth_normalized)
-                lags = np.arange(-(n-1), n)
-                best_lag_idx = np.argmax(correlation)  # CHANGED: removed abs()
-                best_lag = lags[best_lag_idx]
-                t_offset = best_lag / fps
-
-                # Check correlation strength
-                max_corr = correlation[best_lag_idx] / n  # CHANGED: removed abs()
                 if max_corr < 0.3:
-                    print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f}), alignment may be unreliable")
-
-                # Check time offset is reasonable
+                    print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f})")
+                if abs(t_offset) > 1.0:
+                    print(f"Warning: {video_dir.name} large offset ({t_offset:.2f}s) - may indicate sync issue")
                 if abs(t_offset) > 2.0:
-                    print(f"Warning: {video_dir.name} large time offset ({t_offset:.2f}s), checking data integrity")
+                    raise ValueError(f"{video_dir.name}: t_offset {t_offset:.2f}s exceeds 2.0s limit")
 
+                # Shift motor signal
+                motor_pos_aligned = shift_signal(motor_pos_for_corr, best_lag)
                 motor_ts_aligned = motor_ts + t_offset
 
-                # --- Step 2: Use Tag's min/max moments to establish linear mapping ---
-                # Use N-frame average instead of single argmin/argmax (more robust to noise)
-                valid_mask = ~np.isnan(tag_widths_smooth)
-                valid_indices = np.where(valid_mask)[0]
-                valid_widths = tag_widths_smooth[valid_mask]
+                # --- Step 4: Find reference points using stable region detection ---
+                # Each episode computes independently, don't reuse calibration ratio
+                close_point, open_point = find_reference_points(
+                    tag_widths_smooth, motor_pos_aligned
+                )
 
-                if len(valid_widths) < 30:
-                    print(f"Skipping {video_dir.name}: insufficient valid tag detections ({len(valid_widths)})")
-                    continue
+                # --- Step 5: Calculate linear mapping ---
+                ratio, offset = calculate_linear_mapping(close_point, open_point)
 
-                N = min(10, max(3, len(valid_widths) // 10))
-                sorted_local_indices = np.argsort(valid_widths)
-                min_region_local = sorted_local_indices[:N]
-                max_region_local = sorted_local_indices[-N:]
-                min_region_indices = valid_indices[min_region_local]
-                max_region_indices = valid_indices[max_region_local]
+                # ratio should be positive (motor already direction-corrected)
+                if ratio <= 0:
+                    raise ValueError(f"{video_dir.name}: unexpected negative ratio ({ratio:.6f})")
 
-                # Calculate center time and average value for min/max regions
-                t_close = np.mean(full_video_timestamps[min_region_indices])
-                t_open = np.mean(full_video_timestamps[max_region_indices])
-                tag_close = np.mean(tag_widths_smooth[min_region_indices])
-                tag_open = np.mean(tag_widths_smooth[max_region_indices])
+                # --- Step 6: Convert motor to width ---
+                # Apply polarity correction to full motor_pos
+                motor_pos_corrected = motor_pos * (1.0 if motor_scale_sign >= 0 else -1.0)
+                motor_widths_raw = motor_pos_corrected * ratio + offset
 
-                # Sample motor_pos at these aligned timestamps
-                motor_at_close = float(np.interp(t_close, motor_ts_aligned, motor_pos))
-                motor_at_open = float(np.interp(t_open, motor_ts_aligned, motor_pos))
+                # Normalize: subtract calibration min_width, so physical closed = 0
+                # min_width comes from gripper_range.json (physical limit from calibration)
+                motor_widths = motor_widths_raw - min_width
 
-                # --- Step 3: Calculate linear transform parameters ---
-                motor_diff = motor_at_open - motor_at_close
-                tag_span = tag_open - tag_close
+                # Clip only prevents extreme anomalies (e.g., negative due to computation error)
+                # Don't force data range, output actual data as-is
+                motor_widths = np.clip(motor_widths, 0.0, max_width - min_width)
 
-                if abs(motor_diff) < 1e-6:
-                    print(f"Skipping {video_dir.name}: motor diff too small ({motor_diff})")
-                    continue
-                if tag_span < 0.005:
-                    print(f"Skipping {video_dir.name}: tag span too small ({tag_span:.4f}m)")
-                    continue
-
-                # ratio can be positive or negative, automatically handles motor polarity
-                ratio = tag_span / motor_diff
-                offset = tag_close - motor_at_close * ratio
-
-                # --- Step 4: Convert motor to absolute physical width (meters) ---
-                motor_widths_raw = motor_pos * ratio + offset
-                motor_widths = np.clip(motor_widths_raw, 0.0, max_width - min_width)
-
-                # Check clipping ratio
-                clipped_low = np.sum(motor_widths_raw < 0) / len(motor_widths_raw)
-                clipped_high = np.sum(motor_widths_raw > max_width - min_width) / len(motor_widths_raw)
+                # Clipping check (anomaly detection)
+                clipped_low = np.sum(motor_widths_raw - min_width < 0) / len(motor_widths_raw)
+                clipped_high = np.sum(motor_widths_raw - min_width > max_width - min_width) / len(motor_widths_raw)
                 if clipped_low > 0.05:
-                    print(f"Warning: {video_dir.name} {clipped_low:.1%} samples clipped to 0")
+                    print(f"Warning: {video_dir.name} {clipped_low:.1%} samples below min_width")
                 if clipped_high > 0.05:
-                    print(f"Warning: {video_dir.name} {clipped_high:.1%} samples clipped to max")
+                    print(f"Warning: {video_dir.name} {clipped_high:.1%} samples above max_width")
 
-                # Debug output for linear mapping parameters
                 print(f"  {video_dir.name}: t_offset={t_offset:.3f}s, ratio={ratio:.6f} m/rad, "
                       f"offset={offset:.4f}m, width=[{motor_widths.min():.4f}, {motor_widths.max():.4f}]m")
 

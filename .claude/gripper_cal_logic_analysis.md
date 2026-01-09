@@ -923,3 +923,560 @@ motor_pos ──┬──[条件反转]──> motor_pos_for_corr ──> correl
 2. 线性映射使用**原始 motor 信号**（对齐后），ratio 的符号反映真实的物理关系
 3. 整个数学闭环是正确的：负 ratio 会在 `motor_widths = motor_pos * ratio + offset` 中正确反转 motor 方向
 
+
+===== 20260110新增====
+# Motor Alignment Integration Plan
+
+## Summary
+
+将 `scripts/test_motor_alignment_interactive.py` 中验证过的对齐和校准逻辑集成到 pipeline 中，**完全替换**现有算法。
+
+原则: 严禁fallback, 优先报错让用户解决, 这对科研工作非常重要! 实现前请读一遍CLAUDE.MD!
+
+代码（包括变量名、字符串输出、注释）必须完全使用英文, 不能出现中文
+
+## 详细差异对比
+
+### 1. 信号预处理
+
+| 方面 | test (验证过) | pipeline (现有) |
+|------|--------------|-----------------|
+| NaN 填充 | 线性插值 (Line 137) | 依赖 gripper_interp |
+| 滤波 | `medfilt(31)` + `savgol(15,2)` | `gaussian_filter1d(sigma=2)` |
+
+### 2. 时间对齐
+
+| 方面 | test (验证过) | pipeline (现有) |
+|------|--------------|-----------------|
+| 互相关信号 | **差分信号 `np.diff()`** | 原始信号 |
+| 归一化 | z-score `(x-mean)/std` | percentile `(x-mean)/p98` |
+| 互相关函数 | `scipy.signal.correlate` | `np.correlate` |
+| 搜索范围 | **显式限制 ±2s** | 无限制 (只有警告) |
+
+注意: 其实超过1秒都是非常严重的, 所以这里仍然要有警告
+
+### 3. 参考点检测
+
+| 方面 | test (验证过) | pipeline (现有) |
+|------|--------------|-----------------|
+| Close | `argmin(tag_widths)` | N 个最小值平均 |
+| Open | **稳定区域检测** (motor 变化<1e-3 且持续>60帧) | N 个最大值平均 |
+
+### 4. 极性检测 (motor_scale_sign)
+
+| 方面 | test | calibrate_gripper_range.py (现有) |
+|------|------|----------------------------------|
+| 方法 | 从 calibrate_gripper_range产生的json 加载 | 基于"开头帧median=close, 最远点=open" |
+| 分析 | 不用改calibrate_gripper_range.py中的极性检测逻辑, pipeline中从校准流程中读取这个极性就行 |
+
+### 5. max_width 计算
+
+| 方面 | test (验证过) | calibrate_gripper_range.py (现有) |
+|------|--------------|----------------------------------|
+| 方法 | 线性映射 (ratio * motor + offset) | `np.nanmax(gripper_widths)` |
+| 问题 | - | tag 检测不到时不准 |
+| 改进 | **用完整电机日志(Full Log)的极值进行外推** | - |
+
+---
+
+## Files to Modify
+
+| File | Action |
+|------|--------|
+| `umi/common/motor_alignment.py` | **新建** - 共享工具函数 |
+| `scripts/calibrate_gripper_range.py` | **大幅修改** - 极性检测 + max_width 外推 |
+| `scripts_slam_pipeline/06_generate_dataset_plan.py` | **修改** - 替换对齐逻辑 (Lines 714-810) |
+
+---
+
+## Step 1: Create `umi/common/motor_alignment.py`
+
+```python
+"""Motor-to-Tag alignment utilities for gripper calibration."""
+
+import numpy as np
+from scipy import signal
+from scipy.signal import medfilt, savgol_filter
+from scipy.ndimage import label as scipy_label
+from typing import Tuple, List, Dict, Optional
+
+
+def interpolate_nan(arr: np.ndarray) -> np.ndarray:
+    """线性插值填充 NaN 值"""
+    valid_mask = ~np.isnan(arr)
+    if valid_mask.sum() < 2:
+        raise ValueError("Too few valid samples for interpolation (need at least 2)")
+    valid_indices = np.where(valid_mask)[0]
+    valid_values = arr[valid_mask]
+    return np.interp(np.arange(len(arr)), valid_indices, valid_values)
+
+
+def preprocess_tag_signal(
+    tag_widths: np.ndarray,
+    medfilt_kernel: int = 31,
+    savgol_window: int = 15,
+    savgol_polyorder: int = 2
+) -> np.ndarray:
+    """
+    预处理 tag 宽度信号: 插值 NaN + medfilt 去尖峰 + savgol 平滑
+
+    Args:
+        tag_widths: 原始 tag 宽度数组 (可能含 NaN)
+        medfilt_kernel: median filter kernel size (odd number)
+        savgol_window: Savitzky-Golay filter window length
+        savgol_polyorder: Savitzky-Golay filter polynomial order
+
+    Returns:
+        预处理后的信号 (无 NaN)
+    """
+    # 1. 线性插值填充 NaN
+    result = interpolate_nan(tag_widths.copy())
+
+    # 2. Median filter 去尖峰
+    result = medfilt(result, kernel_size=medfilt_kernel)
+
+    # 3. Savitzky-Golay filter 平滑
+    if len(result) > savgol_window:
+        result = savgol_filter(result, window_length=savgol_window, polyorder=savgol_polyorder)
+
+    return result
+
+
+def normalize_z_score(arr: np.ndarray) -> np.ndarray:
+    """Z-score 归一化: (x - mean) / std"""
+    arr_std = np.std(arr)
+    if arr_std < 1e-9:
+        return np.zeros_like(arr)
+    return (arr - np.mean(arr)) / arr_std
+
+
+def cross_correlate_diff_signals(
+    tag_signal: np.ndarray,
+    motor_signal: np.ndarray,
+    fps: float,
+    max_lag_sec: float = 2.0
+) -> Tuple[int, float, float]:
+    """
+    使用差分信号进行互相关时间对齐
+
+    Args:
+        tag_signal: 预处理后的 tag 宽度信号
+        motor_signal: 重采样后的 motor 位置信号 (已应用 polarity)
+        fps: 帧率
+        max_lag_sec: 最大搜索范围 (秒)
+
+    Returns:
+        (best_lag_frames, t_offset_sec, max_correlation)
+    """
+    # 1. 计算差分
+    tag_diff = np.diff(tag_signal)
+    motor_diff = np.diff(motor_signal)
+
+    # 2. Z-score 归一化
+    tag_diff_norm = normalize_z_score(tag_diff)
+    motor_diff_norm = normalize_z_score(motor_diff)
+
+    # 3. 互相关
+    correlation = signal.correlate(tag_diff_norm, motor_diff_norm, mode='full')
+    n = len(tag_diff_norm)
+    lags = np.arange(-(n-1), n)
+
+    # 4. 限制搜索范围到 ±max_lag_sec
+    max_lag_frames = int(max_lag_sec * fps)
+    center = n - 1
+    search_start = max(0, center - max_lag_frames)
+    search_end = min(len(correlation), center + max_lag_frames)
+
+    # 5. 在限制范围内找最大值
+    search_corr = correlation[search_start:search_end]
+    best_local_idx = np.argmax(search_corr)
+    best_lag_idx = search_start + best_local_idx
+    best_lag = lags[best_lag_idx]
+
+    t_offset = best_lag / fps
+    max_corr = correlation[best_lag_idx] / n
+
+    return best_lag, t_offset, max_corr
+
+
+def shift_signal(arr: np.ndarray, lag: int) -> np.ndarray:
+    """Shift signal by lag frames."""
+    result = np.zeros_like(arr)
+    if lag > 0:
+        result[lag:] = arr[:-lag]
+    elif lag < 0:
+        result[:lag] = arr[-lag:]
+    else:
+        result[:] = arr
+    return result
+
+
+def find_stable_regions(
+    signal: np.ndarray,
+    diff_threshold: float = 1e-3,
+    min_duration_frames: int = 60
+) -> List[Dict]:
+    """
+    检测信号中的稳定区域 (变化率低于阈值且持续时间足够长)
+
+    Args:
+        signal: 输入信号
+        diff_threshold: 帧间差异阈值
+        min_duration_frames: 最小持续帧数
+
+    Returns:
+        稳定区域列表
+    """
+    # 计算帧间绝对差异
+    abs_diff = np.abs(np.diff(signal, prepend=signal[0]))
+
+    # 标记稳定帧
+    is_stable = abs_diff < diff_threshold
+
+    # 找连续稳定区域
+    labeled_array, num_features = scipy_label(is_stable)
+
+    valid_segments = []
+    for i in range(1, num_features + 1):
+        indices = np.where(labeled_array == i)[0]
+        if len(indices) >= min_duration_frames:
+            avg_pos = np.mean(signal[indices])
+            valid_segments.append({
+                'indices': indices,
+                'length': len(indices),
+                'avg_pos': avg_pos,
+                'start': indices[0],
+                'end': indices[-1]
+            })
+
+    return valid_segments
+
+
+def find_reference_points(
+    tag_widths: np.ndarray,
+    motor_pos_aligned: np.ndarray,
+    diff_threshold: float = 1e-3,
+    min_duration_frames: int = 60
+) -> Tuple[Dict, Dict]:
+    """
+    找到 close 和 open 参考点
+
+    - Close: tag_widths 的 argmin
+    - Open: motor 稳定区域中平均位置最大的区域 (fallback: argmax)
+
+    Returns:
+        (close_point, open_point)
+    """
+    # Close point: simple argmin
+    idx_close = np.argmin(tag_widths)
+    close_point = {
+        'index': idx_close,
+        'width': tag_widths[idx_close],
+        'motor': motor_pos_aligned[idx_close]
+    }
+
+    # Open point: stable region with max motor position
+    stable_regions = find_stable_regions(motor_pos_aligned, diff_threshold, min_duration_frames)
+
+    if not stable_regions:
+        # Fallback to simple argmax
+        idx_open = np.argmax(tag_widths)
+        open_point = {
+            'index': idx_open,
+            'width': tag_widths[idx_open],
+            'motor': motor_pos_aligned[idx_open]
+        }
+    else:
+        # Choose region with maximum average motor position
+        best_segment = max(stable_regions, key=lambda x: x['avg_pos'])
+        indices = best_segment['indices']
+        open_point = {
+            'index': int((indices[0] + indices[-1]) / 2),
+            'width': np.mean(tag_widths[indices]),
+            'motor': np.mean(motor_pos_aligned[indices]),
+            'segment': best_segment  # for debugging
+        }
+
+    return close_point, open_point
+
+
+def calculate_linear_mapping(
+    close_point: Dict,
+    open_point: Dict
+) -> Tuple[float, float]:
+    """
+    计算线性映射参数: width = ratio * motor_pos + offset
+
+    Returns:
+        (ratio, offset)
+    """
+    motor_diff = open_point['motor'] - close_point['motor']
+    width_diff = open_point['width'] - close_point['width']
+
+    if abs(motor_diff) < 1e-6:
+        raise ValueError("Motor positions for open/close are too close")
+
+    ratio = width_diff / motor_diff
+    offset = open_point['width'] - ratio * open_point['motor']
+
+    return ratio, offset
+```
+
+---
+
+## Step 2: Modify `scripts/calibrate_gripper_range.py`
+
+### 设计说明
+
+- **极性判断保持现有逻辑**：基于标准校准流程（开始闭合、然后打开）推断 motor_scale_sign
+- **其他处理和 test 脚本一致**：先修正 motor 方向，再做互相关、参考点检测、线性映射
+- **ratio 不含方向信息**：因为 motor 已经修正过方向，ratio 始终为正
+- **max_width 外推**：使用完整电机日志的极值进行外推，避免 tag 检测丢失导致的不准确
+
+### 完整修改后的代码结构
+
+```python
+# === 新增 imports ===
+from umi.common.motor_alignment import (
+    preprocess_tag_signal,
+    cross_correlate_diff_signals,
+    shift_signal,
+    find_reference_points,
+    calculate_linear_mapping
+)
+
+# === 主要逻辑修改 (替换 Lines 82-144) ===
+
+def main(input, output, gripper_id, tag_det_threshold, nominal_z):
+    # ... 现有的 tag 检测逻辑 (Lines 40-95) 保持不变 ...
+
+    # 加载 motor 数据
+    motor_ts, motor_pos = load_motor_jsonl(motor_path)
+    motor_ts = motor_ts - motor_ts[0]
+
+    # 获取 fps
+    fps = get_video_fps(video_path)  # 现有逻辑
+
+    # === Step 2.1: 极性判断 (保持现有逻辑) ===
+    # 基于标准校准流程：开始时闭合，然后打开
+    initial_window = min(10, len(motor_pos))
+    close_pos_est = np.median(motor_pos[:initial_window])
+    max_dist_idx = np.argmax(np.abs(motor_pos - close_pos_est))
+    open_pos_est = motor_pos[max_dist_idx]
+    motor_span = open_pos_est - close_pos_est
+    motor_scale_sign = 1 if motor_span > 0 else -1
+
+    if abs(motor_span) < 0.01:
+        raise ValueError(f"Motor span too small ({motor_span:.4f} rad), check calibration data")
+
+    print(f"Polarity: close={close_pos_est:.4f}, open={open_pos_est:.4f}, sign={motor_scale_sign}")
+
+    # === Step 2.2: 预处理和对齐 (和 test 脚本一致) ===
+    tag_timestamps = np.arange(len(gripper_widths)) / fps
+    tag_widths_filled = preprocess_tag_signal(np.array(gripper_widths))
+
+    # 重采样 motor 到 tag 时间轴，并应用极性修正
+    motor_resampled = np.interp(tag_timestamps, motor_ts, motor_pos)
+    motor_for_corr = motor_resampled * (1.0 if motor_scale_sign >= 0 else -1.0)
+
+    # 互相关时间对齐
+    best_lag, t_offset, max_corr = cross_correlate_diff_signals(
+        tag_widths_filled, motor_for_corr, fps
+    )
+
+    if abs(t_offset) > 1.0:
+        print(f"Warning: large t_offset ({t_offset:.2f}s) - may indicate sync issue")
+    if abs(t_offset) > 2.0:
+        raise ValueError(f"t_offset {t_offset:.2f}s exceeds 2.0s limit")
+
+    motor_pos_aligned = shift_signal(motor_for_corr, best_lag)
+
+    # === Step 2.3: 参考点检测和线性映射 ===
+    close_point, open_point = find_reference_points(tag_widths_filled, motor_pos_aligned)
+    ratio, offset = calculate_linear_mapping(close_point, open_point)
+
+    # ratio 应该为正 (因为 motor 已经修正过方向)
+    if ratio <= 0:
+        raise ValueError(f"Unexpected negative ratio ({ratio:.6f}), check polarity logic")
+
+    # === Step 2.4: 使用完整电机日志外推 max/min width ===
+    # 对完整 motor_pos 应用极性修正
+    motor_pos_corrected = motor_pos * (1.0 if motor_scale_sign >= 0 else -1.0)
+
+    # 外推宽度
+    motor_full_max = np.max(motor_pos_corrected)
+    motor_full_min = np.min(motor_pos_corrected)
+    extrapolated_max_width = ratio * motor_full_max + offset
+    extrapolated_min_width = ratio * motor_full_min + offset
+
+    # Tag 检测的原始值 (作为参考)
+    tag_max_width = np.nanmax(gripper_widths)
+    tag_min_width = np.nanmin(gripper_widths)
+
+    # 安全检查: 允许 5% 容差
+    tolerance = 0.05 * (extrapolated_max_width - extrapolated_min_width)
+    if tag_max_width > extrapolated_max_width + tolerance:
+        raise ValueError(f"Tag width ({tag_max_width:.4f}m) > extrapolated limit ({extrapolated_max_width:.4f}m)")
+    if tag_min_width < extrapolated_min_width - tolerance:
+        print(f"Warning: Tag min ({tag_min_width:.4f}m) < extrapolated min ({extrapolated_min_width:.4f}m)")
+
+    max_width = extrapolated_max_width
+    min_width = max(0, extrapolated_min_width)  # 宽度不能为负
+
+    print(f"Tag detected: min={tag_min_width:.4f}m, max={tag_max_width:.4f}m")
+    print(f"Extrapolated: min={extrapolated_min_width:.4f}m, max={extrapolated_max_width:.4f}m")
+    print(f"Final: min={min_width:.4f}m, max={max_width:.4f}m")
+    print(f"Linear mapping: width = {ratio:.6f} * motor_corrected + {offset:.6f}")
+
+    # === Step 2.5: 保存结果 ===
+    result = {
+        'gripper_id': gripper_id,
+        'left_finger_tag_id': left_id,
+        'right_finger_tag_id': right_id,
+        'max_width': float(max_width),
+        'min_width': float(min_width),
+        'motor_scale_sign': motor_scale_sign,
+        # 调试信息 (不用于下游计算，下游会独立计算 ratio)
+        'debug_ratio': float(ratio),
+        'debug_offset': float(offset),
+        'debug_t_offset': float(t_offset),
+        'debug_correlation': float(max_corr),
+        'tag_max_width': float(tag_max_width),
+        'tag_min_width': float(tag_min_width),
+    }
+    json.dump(result, open(output, 'w'), indent=2)
+```
+
+---
+
+## Step 3: Modify `scripts_slam_pipeline/06_generate_dataset_plan.py`
+
+### 设计说明
+
+- **motor_scale_sign 从 JSON 加载**：使用 calibrate 阶段确定的极性
+- **每个 episode 独立计算 ratio**：不复用 calibrate 的 ratio，因为任务数据和校准数据不同（任务时可能不会开到最大、电机零点可能偏移等）
+- **最终输出归一化**：`width = motor_widths_raw - min_width`，使物理闭合对应 0
+- **实际数据范围不强制**：如果某 episode 的数据是 [0.02, 0.05]，就输出 [0.02, 0.05]
+
+### 3.1 Add Import
+
+```python
+from umi.common.motor_alignment import (
+    preprocess_tag_signal,
+    cross_correlate_diff_signals,
+    shift_signal,
+    find_reference_points,
+    calculate_linear_mapping
+)
+```
+
+### 3.2 Replace Alignment Logic (Lines 714-810)
+
+```python
+# === 替换现有代码 (Lines 714-810) ===
+
+fps = float(row['fps'])
+full_video_timestamps = np.arange(len(full_tag_detection_results), dtype=float) / fps
+tag_widths_full = gripper_interp(full_video_timestamps)
+
+# --- Step 1: Preprocess tag signal (替换 gaussian_filter1d) ---
+tag_widths_smooth = preprocess_tag_signal(tag_widths_full)
+
+# --- Step 2: Resample motor and apply polarity ---
+# motor_scale_sign 从 calibrate JSON 加载
+motor_pos_resampled = np.interp(full_video_timestamps, motor_ts, motor_pos)
+motor_scale_sign = gripper_id_motor_scale_sign_map[ghi]
+motor_pos_for_corr = motor_pos_resampled * (1.0 if motor_scale_sign >= 0 else -1.0)
+
+# --- Step 3: Time alignment using diff cross-correlation ---
+best_lag, t_offset, max_corr = cross_correlate_diff_signals(
+    tag_widths_smooth, motor_pos_for_corr, fps
+)
+
+if max_corr < 0.3:
+    print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f})")
+if abs(t_offset) > 1.0:
+    print(f"Warning: {video_dir.name} large offset ({t_offset:.2f}s) - may indicate sync issue")
+if abs(t_offset) > 2.0:
+    raise ValueError(f"{video_dir.name}: t_offset {t_offset:.2f}s exceeds 2.0s limit")
+
+# Shift motor signal
+motor_pos_aligned = shift_signal(motor_pos_for_corr, best_lag)
+motor_ts_aligned = motor_ts + t_offset
+
+# --- Step 4: Find reference points using stable region detection ---
+# 每个 episode 独立计算，不复用 calibrate 的 ratio
+close_point, open_point = find_reference_points(
+    tag_widths_smooth, motor_pos_aligned
+)
+
+# --- Step 5: Calculate linear mapping ---
+ratio, offset = calculate_linear_mapping(close_point, open_point)
+
+# ratio 应该为正 (因为 motor 已经修正过方向)
+if ratio <= 0:
+    raise ValueError(f"{video_dir.name}: unexpected negative ratio ({ratio:.6f})")
+
+# --- Step 6: Convert motor to width ---
+# 对完整 motor_pos 应用极性修正
+motor_pos_corrected = motor_pos * (1.0 if motor_scale_sign >= 0 else -1.0)
+motor_widths_raw = motor_pos_corrected * ratio + offset
+
+# 归一化：减去 calibrate 的 min_width，使物理闭合对应 0
+# min_width 来自 gripper_range.json (calibrate 阶段确定的物理极限)
+motor_widths = motor_widths_raw - min_width
+
+# Clip 只防止极端异常 (如计算误差导致的负数或超过物理极限)
+# 不强制改变数据范围，实际数据是什么就输出什么
+motor_widths = np.clip(motor_widths, 0.0, max_width - min_width)
+
+# Clipping check (异常检测)
+clipped_low = np.sum(motor_widths_raw - min_width < 0) / len(motor_widths_raw)
+clipped_high = np.sum(motor_widths_raw - min_width > max_width - min_width) / len(motor_widths_raw)
+if clipped_low > 0.05:
+    print(f"Warning: {video_dir.name} {clipped_low:.1%} samples below min_width")
+if clipped_high > 0.05:
+    print(f"Warning: {video_dir.name} {clipped_high:.1%} samples above max_width")
+
+print(f"  {video_dir.name}: t_offset={t_offset:.3f}s, ratio={ratio:.6f} m/rad, "
+      f"offset={offset:.4f}m, width=[{motor_widths.min():.4f}, {motor_widths.max():.4f}]m")
+```
+
+---
+
+## Verification
+
+1. **校准阶段测试**:
+   ```bash
+   python scripts/calibrate_gripper_range.py \
+       -i data/run_xxx/demos/gripper_calibration_gp00/tag_detection.pkl \
+       -o /tmp/test_gripper_range.json \
+       -g 0
+   ```
+   检查输出的 `motor_scale_sign`, `max_width`, `ratio`, `offset` 是否合理
+
+2. **Pipeline 测试**:
+   ```bash
+   python scripts_slam_pipeline/06_generate_dataset_plan.py \
+       --input data/run_20260108T192932Z --debug
+   ```
+   检查 debug 图中 tag width 和 aligned motor width 曲线是否对齐
+
+3. **对比新旧输出**:
+   - `t_offset` 应该接近 (差异 < 0.1s)
+   - `ratio` 和 `offset` 应该产生合理的 width 范围
+
+---
+
+## Configuration Parameters
+
+所有参数都有默认值，可在调用时覆盖:
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `medfilt_kernel` | 31 | Median filter kernel (去尖峰) |
+| `savgol_window` | 15 | Savitzky-Golay window (~0.25s @60fps) |
+| `savgol_polyorder` | 2 | Savitzky-Golay 多项式阶数 |
+| `max_lag_sec` | 2.0 | 互相关搜索范围 (±2秒) |
+| `diff_threshold` | 1e-3 | 稳定区域检测阈值 (rad/frame) |
+| `min_duration_frames` | 60 | 稳定区域最小持续帧数 (~1s @60fps) |

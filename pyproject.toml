@@ -28,4 +28,5 @@ dependencies = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "rerun-sdk>=0.23.1",
+    "pip>=25.3",
 ]
