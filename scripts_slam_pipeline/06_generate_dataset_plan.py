@@ -695,7 +695,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
                     nominal_z=nominal_z)
                 if width is not None:
                     gripper_timestamps.append(i / float(row['fps']))
-                    gripper_widths.append(gripper_cal_interp(width) - min_width)
+                    gripper_widths.append(gripper_cal_interp(width))
             gripper_interp = get_interp1d(gripper_timestamps, gripper_widths)
             
             gripper_det_ratio = (len(gripper_widths) / len(full_tag_detection_results))
@@ -737,7 +737,9 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 )
 
                 if max_corr < 0.3:
-                    print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f})")
+                    print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f}), skipping")
+                    dropped_camera_count[row['camera_serial']] += 1
+                    continue
                 if abs(t_offset) > 1.0:
                     print(f"Warning: {video_dir.name} large offset ({t_offset:.2f}s) - may indicate sync issue")
                 if abs(t_offset) > 2.0:
@@ -765,17 +767,17 @@ def main(input, output, tcp_offset, tx_slam_tag,
                 motor_pos_corrected = motor_pos * (1.0 if motor_scale_sign >= 0 else -1.0)
                 motor_widths_raw = motor_pos_corrected * ratio + offset
 
-                # Normalize: subtract calibration min_width, so physical closed = 0
-                # min_width comes from gripper_range.json (physical limit from calibration)
-                motor_widths = motor_widths_raw - min_width
+                # motor_widths_raw is already relative width (0 = closed)
+                # because gripper_cal_interp already maps to [0, max_width - min_width]
+                motor_widths = motor_widths_raw
 
                 # Clip only prevents extreme anomalies (e.g., negative due to computation error)
                 # Don't force data range, output actual data as-is
                 motor_widths = np.clip(motor_widths, 0.0, max_width - min_width)
 
                 # Clipping check (anomaly detection)
-                clipped_low = np.sum(motor_widths_raw - min_width < 0) / len(motor_widths_raw)
-                clipped_high = np.sum(motor_widths_raw - min_width > max_width - min_width) / len(motor_widths_raw)
+                clipped_low = np.sum(motor_widths_raw < 0) / len(motor_widths_raw)
+                clipped_high = np.sum(motor_widths_raw > max_width - min_width) / len(motor_widths_raw)
                 if clipped_low > 0.05:
                     print(f"Warning: {video_dir.name} {clipped_low:.1%} samples below min_width")
                 if clipped_high > 0.05:
