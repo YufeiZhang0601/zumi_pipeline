@@ -924,8 +924,10 @@ def main(input, output, tcp_offset, tx_slam_tag,
                     uvc_info = uvc_data['uvc_info']
                     uvc_frame_indices = uvc_data['uvc_frame_indices']
 
+                    # Ensure UVC frame count matches GoPro frame count
+                    gopro_n_frames = end - start
                     uvc_start_frame = int(uvc_frame_indices[start])
-                    uvc_end_frame = int(uvc_frame_indices[end - 1]) + 1
+                    uvc_end_frame = uvc_start_frame + gopro_n_frames
 
                     cameras.append({
                         "video_path": str(uvc_info['video_path'].relative_to(video_dir.parent)),
