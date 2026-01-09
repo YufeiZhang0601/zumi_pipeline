@@ -325,18 +325,6 @@ class GoProNode(NodeHTTPService):
         logger.info(f"[Download] Downloading {filename} -> {save_name} ...")
         try:
             self.cam.download_file(folder, filename, save_path)
-
-            # Rename motor files to include gopro tag
-            gopro_basename = os.path.splitext(filename)[0]
-            old_motor_jsonl = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_motor.jsonl"
-            new_motor_jsonl = run_dir / f"{run_id}_{ep_tag}_{self.gripper_id}_{gopro_basename}_motor.jsonl"
-            if old_motor_jsonl.exists():
-                try:
-                    old_motor_jsonl.rename(new_motor_jsonl)
-                    logger.info(f"[Sync] Renamed motor file: {old_motor_jsonl.name} -> {new_motor_jsonl.name}")
-                except Exception as exc:
-                    logger.error(f"[Sync] Failed to rename motor file: {exc}")
-
             logger.info(f"[Download] Success: {save_name}")
         except Exception as exc:
             logger.error(f"[Download] Failed {save_name}: {exc}")

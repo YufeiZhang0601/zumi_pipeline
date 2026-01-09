@@ -1,13 +1,17 @@
 import json
 import logging
+import multiprocessing as mp
+import os
 import queue
 import threading
 import time
+from collections import deque
 from pathlib import Path
+from queue import Full
 from typing import Optional
 
 from zumi_core import NodeHTTPService
-from zumi_config import HTTP_CONF, MOTOR_CONF, NodeStatus, STORAGE_CONF, get_default_gripper_id
+from zumi_config import HTTP_CONF, MOTOR_CONF, NodeStatus, PREVIEW_CONF, STORAGE_CONF, get_default_gripper_id
 from zumi_util import RateLimiter
 from motor_dm import DMMotorDriver
 
@@ -28,16 +32,137 @@ def _build_driver(auto_set_zero: bool = True):
     )
 
 
+# -----------------------------------------------------------------------------
+# Preview Process (runs in separate process to avoid GIL interference)
+# -----------------------------------------------------------------------------
+class MotorPreviewProcess(mp.Process):
+    """Real-time motor data visualization using OpenCV."""
+
+    def __init__(self, data_queue: mp.Queue, gripper_id: str, stop_event: mp.Event):
+        super().__init__(daemon=True)
+        self.data_queue = data_queue
+        self.gripper_id = gripper_id
+        self.stop_event = stop_event
+
+    def run(self):
+        import cv2
+        import numpy as np
+
+        cv2.setNumThreads(1)
+
+        # Canvas size
+        width, height = 800, 600
+        plot_height = height // 3  # 3 plots stacked vertically
+        margin_left, margin_right = 60, 20
+        margin_top, margin_bottom = 25, 20
+        plot_width = width - margin_left - margin_right
+
+        # Data buffers
+        buffer_size = PREVIEW_CONF.MOTOR_BUFFER_SIZE
+        pos_buffer = deque(maxlen=buffer_size)
+        vel_buffer = deque(maxlen=buffer_size)
+        tau_buffer = deque(maxlen=buffer_size)
+
+        # Y-axis ranges
+        ranges = [(-1.0, 1.0), (-5.0, 5.0), (-2.0, 2.0)]
+        labels = ["Position (rad)", "Velocity (rad/s)", "Torque (Nm)"]
+        colors = [(255, 100, 100), (100, 255, 100), (100, 100, 255)]  # BGR
+
+        window_name = f"Motor Preview: {self.gripper_id}"
+        interval_ms = int(1000 / PREVIEW_CONF.MOTOR_PREVIEW_FPS)
+
+        def draw_plot(canvas, data, y_range, color, y_offset, label):
+            """Draw a single plot on the canvas."""
+            y_min, y_max = y_range
+            plot_y_start = y_offset + margin_top
+            plot_y_end = y_offset + plot_height - margin_bottom
+            plot_h = plot_y_end - plot_y_start
+
+            # Draw background and border
+            cv2.rectangle(canvas, (margin_left, plot_y_start),
+                         (margin_left + plot_width, plot_y_end), (40, 40, 40), -1)
+            cv2.rectangle(canvas, (margin_left, plot_y_start),
+                         (margin_left + plot_width, plot_y_end), (80, 80, 80), 1)
+
+            # Draw zero line
+            zero_y = int(plot_y_start + plot_h * (y_max / (y_max - y_min)))
+            if plot_y_start < zero_y < plot_y_end:
+                cv2.line(canvas, (margin_left, zero_y),
+                        (margin_left + plot_width, zero_y), (60, 60, 60), 1)
+
+            # Draw label
+            cv2.putText(canvas, label, (5, y_offset + plot_height // 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+            # Draw y-axis ticks
+            for val in [y_min, 0, y_max]:
+                y_pos = int(plot_y_start + plot_h * (1 - (val - y_min) / (y_max - y_min)))
+                if plot_y_start <= y_pos <= plot_y_end:
+                    cv2.putText(canvas, f"{val:.1f}", (margin_left - 35, y_pos + 4),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+
+            # Draw data - use actual data length for x scaling
+            n = len(data)
+            if n >= 2:
+                points = []
+                for i, val in enumerate(data):
+                    # Scale x to fill the plot width based on actual data
+                    x = margin_left + int(i * plot_width / max(n - 1, 1))
+                    y = plot_y_start + int(plot_h * (1 - (val - y_min) / (y_max - y_min)))
+                    y = max(plot_y_start, min(plot_y_end, y))
+                    points.append((x, y))
+                cv2.polylines(canvas, [np.array(points, dtype=np.int32)],
+                             False, color, 2, cv2.LINE_AA)
+
+        # Create window and set position (offset from UVC window)
+        cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.moveWindow(window_name, 850, 50)  # Right side of screen
+
+        while not self.stop_event.is_set():
+            # Drain queue
+            while True:
+                try:
+                    data = self.data_queue.get_nowait()
+                    pos_buffer.append(data["pos"])
+                    vel_buffer.append(data["vel"])
+                    tau_buffer.append(data["tau"])
+                except Exception:
+                    break
+
+            # Create canvas
+            canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+            # Draw title
+            cv2.putText(canvas, f"Motor: {self.gripper_id}", (width // 2 - 60, 18),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+            # Draw plots
+            buffers = [pos_buffer, vel_buffer, tau_buffer]
+            for i, (buf, rng, lbl, clr) in enumerate(zip(buffers, ranges, labels, colors)):
+                draw_plot(canvas, buf, rng, clr, i * plot_height, lbl)
+
+            cv2.imshow(window_name, canvas)
+            key = cv2.waitKey(interval_ms) & 0xFF
+            if key == ord('q') or key == 27:  # q or ESC
+                self.stop_event.set()
+                break
+
+        try:
+            cv2.destroyWindow(window_name)
+        except Exception:
+            pass
+
+
 class MotorNode(NodeHTTPService):
     # Motor uses smaller backoff due to high frequency communication
     RECOVERY_BACKOFF_BASE = 1.0
     RECOVERY_BACKOFF_MAX = 10.0
 
-    def __init__(self, gripper_id: str = None, port: int = None):
+    def __init__(self, gripper_id: str = None, port: int = None, preview: bool = False):
         self.gripper_id = gripper_id or get_default_gripper_id()
         self.driver = None
         self.target_freq = MOTOR_CONF.TARGET_FREQ
-        self.batch_size = 50  # Send to writer every 50 records (~250ms at 200Hz)
+        self.batch_size = max(10, int(self.target_freq * 0.25))  # ~250ms worth of records
         self.lock_duration = MOTOR_CONF.LOCK_DURATION  # Lock gripper position (0 = no lock)
 
         # Writer thread state
@@ -51,6 +176,12 @@ class MotorNode(NodeHTTPService):
         self.recording_start_time: float = 0.0
         self.iter_idx: int = 0
         self.current_path: Optional[Path] = None
+
+        # Preview state (separate process)
+        self.preview_enabled = preview
+        self.preview_queue: Optional[mp.Queue] = None
+        self.preview_process: Optional[MotorPreviewProcess] = None
+        self.preview_stop_event: Optional[mp.Event] = None
 
         super().__init__(
             name=f"motor_{self.gripper_id}",
@@ -132,12 +263,43 @@ class MotorNode(NodeHTTPService):
                 logger.error(f"[Writer] Error: {exc}")
 
     # -------------------------------------------------------------------------
+    # Preview Process (real-time visualization)
+    # -------------------------------------------------------------------------
+    def _start_preview(self):
+        """Start the preview process if display is available."""
+        if os.environ.get("DISPLAY") is None:
+            logger.warning("[Preview] No display available, skipping preview")
+            return
+
+        self.preview_queue = mp.Queue(maxsize=PREVIEW_CONF.MOTOR_QUEUE_SIZE)
+        self.preview_stop_event = mp.Event()
+        self.preview_process = MotorPreviewProcess(
+            self.preview_queue, self.gripper_id, self.preview_stop_event
+        )
+        self.preview_process.start()
+        logger.info("[Preview] Motor preview process started")
+
+    def _stop_preview(self):
+        """Stop the preview process."""
+        if self.preview_stop_event:
+            self.preview_stop_event.set()
+        if self.preview_process and self.preview_process.is_alive():
+            self.preview_process.join(timeout=2.0)
+            if self.preview_process.is_alive():
+                self.preview_process.terminate()
+        self.preview_process = None
+        self.preview_queue = None
+        self.preview_stop_event = None
+
+    # -------------------------------------------------------------------------
     # Lifecycle hooks
     # -------------------------------------------------------------------------
     def on_init(self):
         # DMMotorDriver.__init__ already calls enable() and set_zero()
         self.driver = _build_driver(auto_set_zero=True)
         self._start_writer_thread()
+        if self.preview_enabled:
+            self._start_preview()
         logger.info(f"Motor node initialized (gripper_id={self.gripper_id}).")
 
     def on_prepare(self, run_id, episode=None):
@@ -216,43 +378,17 @@ class MotorNode(NodeHTTPService):
         self.publish_status()
         self.current_path = None
 
-    def _discard_current_recording(self, reason: str):
-        """Discard current recording data due to error."""
-        logger.error("=" * 60)
-        logger.error("!!! RECORDING ABORTED - DATA DISCARDED !!!")
-        logger.error(f"Run: {self.run_id}, Episode: {self.episode}")
-        logger.error(f"Reason: {reason}")
-        logger.error("=" * 60)
-
-        # Clear local buffer
-        self.local_buffer = []
-
-        # Tell writer to discard, passing path for consistent cleanup
-        if self.current_path:
-            self.write_queue.put(("DISCARD", {"path": self.current_path}))
-
-        self.is_recording = False
-        self.current_path = None
-
     def on_discard_run(self, run_id, episode=None):
         path = self._episode_path(run_id, episode)
 
-        # Stop any active recording first
-        if self.is_recording:
-            self.local_buffer = []
+        # Always cleanup writer state (base class already set is_recording=False)
+        self.local_buffer = []
+        if self.write_queue:
             self.write_queue.put(("DISCARD", {"path": path}))
-            self.is_recording = False
-            self.current_path = None
-        else:
-            # Not recording, directly remove file if exists
-            if path.exists():
-                try:
-                    path.unlink()
-                    logger.info(f"[Discard] Removed {path}")
-                except Exception as exc:  # noqa: BLE001
-                    logger.error(f"[Discard] Failed to remove {path}: {exc}")
+        self.current_path = None
 
     def on_shutdown(self):
+        self._stop_preview()
         self._stop_writer_thread()
         if self.driver:
             try:
@@ -261,20 +397,26 @@ class MotorNode(NodeHTTPService):
                 pass
 
     # -------------------------------------------------------------------------
-    # Main loop (200Hz)
+    # Main loop
     # -------------------------------------------------------------------------
     def main_loop(self):
         """
-        Main control loop at 200Hz.
+        Main control loop at configured frequency (MOTOR_CONF.TARGET_FREQ).
         - Always sends command() to maintain CAN communication (watchdog)
         - Locks gripper position when not recording or during first 0.5s of recording
         - Collects data and sends to writer thread via Queue
+        - Sends decimated data to preview process (if enabled)
         - Detects communication failures and triggers recovery
         """
         rate = RateLimiter(self.target_freq)
         get_time = time.time
         consecutive_failures = 0
-        max_failures = 10  # ~50ms at 200Hz
+        max_failures = 3  # Fail fast on communication errors
+        stale_threshold = 0.1  # 100ms without updates considered stale
+        last_logged_stale_time = 0.0
+        consecutive_stale = 0
+        max_consecutive_stale = int(2.0 / stale_threshold)  # ~2s timeout
+        preview_iter = 0  # Counter for preview decimation
 
         while self.is_running:
             # Decide whether to lock gripper position
@@ -304,24 +446,63 @@ class MotorNode(NodeHTTPService):
                         f"Motor communication lost after {consecutive_failures} consecutive failures"
                     ) from exc
 
-            # Collect data during recording
-            if self.is_recording:
+            # Read state if recording OR preview is active
+            should_read_state = self.is_recording or self.preview_queue is not None
+            if should_read_state:
                 try:
                     state = self.driver.get_state()
-                    record = {
-                        "ts": get_time(),
-                        "pos": [state.position],
-                        "vel": [state.velocity],
-                        "tau": [state.torque],
-                        "iter": self.iter_idx,
-                    }
-                    self.local_buffer.append(record)
-                    self.iter_idx += 1
+                    now = get_time()
+                    data_age = now - state.last_update_time
 
-                    # Batch send to writer thread
-                    if len(self.local_buffer) >= self.batch_size:
-                        self.write_queue.put(("DATA", self.local_buffer))
-                        self.local_buffer = []
+                    # Handle stale data detection (only during recording)
+                    if self.is_recording and data_age > stale_threshold:
+                        consecutive_stale += 1
+                        if now - last_logged_stale_time > 1.0:
+                            logger.warning(
+                                f"[Record] Motor data stale! Age: {data_age:.3f}s "
+                                f"({consecutive_stale}/{max_consecutive_stale})"
+                            )
+                            last_logged_stale_time = now
+                        if consecutive_stale >= max_consecutive_stale:
+                            self._discard_current_recording(
+                                f"Stale data too long: {consecutive_stale} consecutive stale samples"
+                            )
+                        rate.sleep()
+                        continue
+
+                    # Data is fresh, reset stale counter
+                    consecutive_stale = 0
+
+                    # Send to preview (decimated, non-blocking)
+                    if self.preview_queue is not None:
+                        preview_iter += 1
+                        if preview_iter % PREVIEW_CONF.MOTOR_DECIMATION == 0:
+                            try:
+                                self.preview_queue.put_nowait({
+                                    "ts": now,
+                                    "pos": state.position,
+                                    "vel": state.velocity,
+                                    "tau": state.torque,
+                                })
+                            except Full:
+                                pass  # Drop frame, don't block main loop
+
+                    # Record data (only during recording)
+                    if self.is_recording:
+                        record = {
+                            "ts": now,
+                            "pos": [state.position],
+                            "vel": [state.velocity],
+                            "tau": [state.torque],
+                            "iter": self.iter_idx,
+                        }
+                        self.local_buffer.append(record)
+                        self.iter_idx += 1
+
+                        # Batch send to writer thread
+                        if len(self.local_buffer) >= self.batch_size:
+                            self.write_queue.put(("DATA", self.local_buffer))
+                            self.local_buffer = []
 
                 except Exception as exc:
                     logger.error(f"State read failed: {exc}")
@@ -443,6 +624,21 @@ def validate(run_id: str, episode: Optional[int], gripper_id: str = None):
         if count == 0:
             return ValidationResult(False, "motor_empty", "Motor data empty")
 
+        # Check sample rate
+        if first_ts and last_ts and last_ts > first_ts:
+            duration = last_ts - first_ts
+            expected_samples = duration * MOTOR_CONF.TARGET_FREQ
+            sample_ratio = count / expected_samples if expected_samples > 0 else 0
+
+            # If less than 50% of expected samples, data quality is too low
+            if sample_ratio < 0.5 and count > 10:  # Only check if we have reasonable data
+                return ValidationResult(
+                    False,
+                    "motor_sample_rate_low",
+                    f"Sample rate too low: {count} samples in {duration:.1f}s "
+                    f"(expected ~{int(expected_samples)}, ratio={sample_ratio:.1%})",
+                )
+
         # Check if data is flat (not changing) - use all data
         if all_positions:
             unique_positions = len(set(round(p, 6) for p in all_positions))
@@ -475,7 +671,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gripper-id", default=None, help="Gripper ID (e.g., gp00)")
     parser.add_argument("--port", type=int, default=HTTP_CONF.MOTOR_PORT, help="HTTP port")
+    parser.add_argument("--preview", action="store_true", help="Enable real-time preview")
     args = parser.parse_args()
 
-    node = MotorNode(gripper_id=args.gripper_id, port=args.port)
+    node = MotorNode(gripper_id=args.gripper_id, port=args.port, preview=args.preview)
     node.start()

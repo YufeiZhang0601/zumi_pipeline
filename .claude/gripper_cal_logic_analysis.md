@@ -685,3 +685,241 @@ print(f"Difference: {abs(old_close_pos - new_close_pos):.4f}")
 
   一致的物理语义，端到端正确
 ```
+
+====20260109 新增====
+# 夹爪极性校准改进计划
+
+## 问题描述
+
+在 `06_generate_dataset_plan.py` 中，当前使用 `np.abs(correlation)` 自动检测 motor 与 tag_width 的极性关系，但在信号弱时效果很差，导致：
+- 所有 episode 都报告 "weak correlation" 警告（correlation < 0.3）
+- ratio 值量级不合理（出现 3.38、1.87 等异常大的值，正常应在 ±0.03~0.1 m/rad）
+- 大量样本被 clip 到 0 或 max（部分 episode 100% 被 clip）
+
+**根本原因**：
+1. Motor position 打开时往**负方向**变化，而 tag_width 打开时**增大**，两者趋势相反
+2. 使用 `np.abs(correlation)` 时，正相关峰值和负相关峰值会"竞争"，噪声可能导致选错 lag
+3. 当选错 t_offset 后，采样到的 motor_at_open/motor_at_close 不正确，导致 ratio 和 offset 计算错误
+
+**为什么预设极性能提高 correlation 强度**：
+- 当两个信号趋势一致时（都是打开=增大），cross-correlation 的真实峰值是正的且更尖锐
+- 不使用 abs() 意味着只搜索正相关峰值，避免噪声导致的假阴性峰值干扰
+- 这可以提高找到正确 t_offset 的概率，从而改善整个 pipeline 的输出质量
+
+## 解决方案
+
+在 gripper_calibration 阶段计算并保存极性信息，然后在 06 步骤中预先反转 motor 信号使其与 tag_width 趋势一致，再做 cross-correlation。
+
+---
+
+## 改动清单
+
+### 1. 修改 `scripts/calibrate_gripper_range.py`
+
+**目的**：计算 motor→meter 的 scale 极性并保存
+
+**改动内容**：
+
+```python
+# 新增：加载motor数据，计算极性
+motor_path = Path(input).parent / 'motor_data.jsonl'
+if not motor_path.exists():
+    raise FileNotFoundError(f"标定数据不完整，缺少 {motor_path}")
+
+# 加载motor数据
+motor_ts, motor_pos = load_motor_jsonl(motor_path)
+motor_ts = motor_ts - motor_ts[0]  # 相对时间
+
+# 使用视频fps对齐（复用 06 脚本中的逻辑）
+video_path = Path(input).parent / 'raw_video.mp4'
+with ExifToolHelper() as et:
+    metadata = et.get_metadata(str(video_path))[0]
+    fps = float(metadata.get('QuickTime:VideoFrameRate', metadata.get('Track1:VideoFrameRate')))
+
+# 对齐时间轴
+tag_ts = np.arange(len(gripper_widths)) / fps
+
+# 找tag的min和max时刻（排除nan）
+valid_mask = ~np.isnan(gripper_widths)
+valid_indices = np.where(valid_mask)[0]
+valid_widths = np.array(gripper_widths)[valid_mask]
+
+# 找闭合和打开时刻
+close_idx = valid_indices[np.argmin(valid_widths)]
+open_idx = valid_indices[np.argmax(valid_widths)]
+
+t_close = tag_ts[close_idx]
+t_open = tag_ts[open_idx]
+
+# 采样motor位置
+motor_at_close = np.interp(t_close, motor_ts, motor_pos)
+motor_at_open = np.interp(t_open, motor_ts, motor_pos)
+
+# 计算scale符号
+# tag_width 打开时增大，motor打开时可能增大或减小
+motor_span = motor_at_open - motor_at_close
+
+# 如果motor变化太小，说明标定过程有问题
+if abs(motor_span) < 0.01:  # 至少0.01 rad的变化
+    raise ValueError(f"标定数据异常：motor变化范围太小 ({motor_span:.4f} rad)，请重新标定")
+
+motor_scale_sign = 1 if motor_span > 0 else -1
+```
+
+**输出的 gripper_range.json 新增字段**：
+
+```json
+{
+  "gripper_id": 0,
+  "left_finger_tag_id": 0,
+  "right_finger_tag_id": 1,
+  "max_width": 0.103,
+  "min_width": 0.059,
+  "motor_scale_sign": -1  // 新增：-1表示motor打开时减小，+1表示增大
+}
+```
+
+---
+
+### 2. 修改 `scripts_slam_pipeline/06_generate_dataset_plan.py`
+
+**目的**：使用预设极性反转motor信号，提高correlation可靠性
+
+**改动位置**：约 700-750 行（cross-correlation 部分）
+
+**改动内容**：
+
+```python
+# 读取 gripper_range.json 中的极性信息
+# (在现有代码读取 gripper_range_data 的位置，约 207-210 行)
+motor_scale_sign = gripper_range_data['motor_scale_sign']  # 必须存在
+
+# ... 在 cross-correlation 之前 (约 722-729 行) ...
+
+# 【新增】根据极性预处理motor信号
+# 如果 motor_scale_sign = -1，说明打开时motor减小
+# 需要反转motor使其与tag趋势一致（都是打开=增大）
+if motor_scale_sign < 0:
+    motor_pos_for_corr = -motor_pos_resampled  # 反转
+else:
+    motor_pos_for_corr = motor_pos_resampled
+
+# Normalize motor (使用反转后的信号)
+motor_pos_centered = motor_pos_for_corr - np.mean(motor_pos_for_corr)
+motor_pos_range = np.percentile(np.abs(motor_pos_centered), 98)
+if motor_pos_range < 1e-6:
+    print(f"Skipping {video_dir.name}: motor range too small")
+    continue
+motor_pos_normalized = motor_pos_centered / motor_pos_range
+
+# Cross-correlation (不再需要 abs，因为已经对齐极性)
+correlation = np.correlate(tag_smooth_normalized, motor_pos_normalized, mode='full')
+n = len(tag_smooth_normalized)
+lags = np.arange(-(n-1), n)
+best_lag_idx = np.argmax(correlation)  # 【改动】不再用 abs
+best_lag = lags[best_lag_idx]
+t_offset = best_lag / fps
+```
+
+---
+
+## 数据流示意
+
+```
+                    gripper_calibration 阶段
+                    ========================
+motor_data.jsonl ─┐
+                  ├─> calibrate_gripper_range.py ─> gripper_range.json
+tag_detection.pkl ┘                                 (含 motor_scale_sign)
+
+
+                    06_generate_dataset_plan 阶段
+                    ==============================
+gripper_range.json ───> 读取 motor_scale_sign
+                              │
+                              v
+demo motor_data.jsonl ───> [条件反转] ───> cross-correlation ───> 对齐
+                              │
+                              v
+                        motor与tag趋势一致
+                        (都是打开=增大)
+```
+
+---
+
+## 文件改动汇总
+
+| 文件 | 改动类型 | 改动说明 |
+|------|----------|----------|
+| `scripts/calibrate_gripper_range.py` | 新增逻辑 | 读取motor数据，计算motor_scale_sign，保存到JSON |
+| `scripts_slam_pipeline/06_generate_dataset_plan.py` | 修改约10行 | 读取motor_scale_sign，条件反转motor，移除abs() |
+
+---
+
+## 验证计划
+
+### 1. 重新运行 gripper_calibration 处理
+
+```bash
+cd /home/yinzi/zumi_pipeline
+SESSION_DIR=/home/yinzi/zumi_pipeline/data/run_20260108T192932Z
+
+# 重新运行校准脚本
+python scripts/calibrate_gripper_range.py \
+  -i $SESSION_DIR/demos/gripper_calibration_gp00/tag_detection.pkl \
+  -o $SESSION_DIR/demos/gripper_calibration_gp00/gripper_range.json
+
+# 检查输出
+cat $SESSION_DIR/demos/gripper_calibration_gp00/gripper_range.json
+# 应该看到 motor_scale_sign 字段
+```
+
+### 2. 重新运行 06 pipeline
+
+```bash
+cd /home/yinzi/zumi_pipeline/scripts_slam_pipeline
+python 06_generate_dataset_plan.py --input $SESSION_DIR
+
+# 预期结果：
+# - correlation 值提高（减少 "weak correlation" 警告）
+# - ratio 值量级稳定（约 ±0.03~0.1 m/rad），不再出现 >1 的异常值
+# - clip 比例大幅降低
+```
+
+**关于 ratio 正负值的说明**：
+- 负 ratio 是数学上正确的（当 motor 打开时减小）
+- 转换公式 `motor_widths = motor_pos * ratio + offset` 依赖负号来正确反转
+- 本方案只在 correlation 阶段反转信号以提高对齐准确性，后续计算 ratio 使用原始信号
+
+### 3. 可视化验证
+
+```bash
+# 启用 debug 模式查看对齐效果
+python 06_generate_dataset_plan.py --input $SESSION_DIR --debug
+
+# 查看生成的对齐图（tag_width 和 motor_width 曲线应该趋势一致）
+```
+
+---
+
+## 技术说明：极性反转的作用范围
+
+```
+Cross-correlation 阶段          Linear Mapping 阶段
+====================          ===================
+
+motor_pos ──┬──[条件反转]──> motor_pos_for_corr ──> correlation ──> t_offset
+            │                                                          │
+            │                                                          v
+            └──────────────────────────────> motor_pos ──[对齐]──> motor_at_open/close
+                                                                       │
+                                                                       v
+                                                              ratio = tag_span / motor_diff
+                                                              (可正可负，数学正确)
+```
+
+**关键点**：
+1. 极性反转**仅用于 cross-correlation**，目的是让两个信号趋势一致以提高峰值检测准确性
+2. 线性映射使用**原始 motor 信号**（对齐后），ratio 的符号反映真实的物理关系
+3. 整个数学闭环是正确的：负 ratio 会在 `motor_widths = motor_pos * ratio + offset` 中正确反转 motor 方向
+

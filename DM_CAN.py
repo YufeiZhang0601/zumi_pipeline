@@ -1,3 +1,4 @@
+import time as _time
 from time import sleep
 import numpy as np
 from enum import IntEnum
@@ -23,11 +24,13 @@ class Motor:
         self.isEnable = False
         self.NowControlMode = Control_Type.MIT
         self.temp_param_dict = {}
+        self.last_update_time = 0.0  # Timestamp of last successful data update
 
     def recv_data(self, q: float, dq: float, tau: float):
         self.state_q = q
         self.state_dq = dq
         self.state_tau = tau
+        self.last_update_time = _time.time()  # Record update timestamp
 
     def getPosition(self):
         """
@@ -49,6 +52,13 @@ class Motor:
         :return: the torque of the motor 电机力矩
         """
         return self.state_tau
+
+    def get_last_update_time(self) -> float:
+        """
+        get the timestamp of last successful data update 获取最后一次成功更新数据的时间戳
+        :return: timestamp in seconds (time.time() format)
+        """
+        return self.last_update_time
 
     def getParam(self, RID):
         """

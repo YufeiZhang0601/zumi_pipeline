@@ -15,7 +15,7 @@ import cv2
 
 from umi.real_world.uvc_camera import UvcCamera
 from umi.real_world.video_recorder import VideoRecorder
-from zumi_config import HTTP_CONF, NodeStatus, STORAGE_CONF, UVC_CONF, get_default_gripper_id
+from zumi_config import HTTP_CONF, NodeStatus, PREVIEW_CONF, STORAGE_CONF, UVC_CONF, get_default_gripper_id
 from zumi_core import NodeHTTPService
 
 logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
@@ -132,6 +132,64 @@ class SidecarWriter:
 
 
 # -----------------------------------------------------------------------------
+# Preview Thread (real-time visualization)
+# -----------------------------------------------------------------------------
+class UvcPreviewThread(threading.Thread):
+    """Real-time UVC camera preview in a background thread."""
+
+    def __init__(self, camera: UvcCamera, gripper_id: str, fps: int = 30):
+        super().__init__(daemon=True)
+        self.camera = camera
+        self.gripper_id = gripper_id
+        self.fps = fps
+        self.stop_event = threading.Event()
+        self.window_name = f"UVC Preview: {gripper_id}"
+
+    def run(self):
+        cv2.setNumThreads(1)  # Limit OpenCV internal threads
+        vis_data = None
+        interval_ms = int(1000 / self.fps)
+
+        # Create window and set position (left side of screen)
+        cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.moveWindow(self.window_name, 50, 50)
+
+        while not self.stop_event.is_set():
+            try:
+                # Check if camera is still alive
+                if not self.camera.is_alive():
+                    logger.warning("[Preview] Camera process died, stopping preview")
+                    break
+
+                vis_data = self.camera.get_vis(out=vis_data)
+                frame = vis_data.get("color")
+                if frame is None:
+                    time.sleep(0.1)
+                    continue
+
+                # Handle multi-camera array shape (N, H, W, C)
+                if len(frame.shape) == 4:
+                    frame = frame[0]
+
+                # RGB to BGR for OpenCV display
+                cv2.imshow(self.window_name, frame[:, :, ::-1])
+                key = cv2.waitKey(interval_ms) & 0xFF
+                if key == ord('q') or key == 27:  # q or ESC
+                    break
+            except Exception as exc:
+                logger.warning(f"[Preview] Frame error: {exc}")
+                time.sleep(0.1)
+
+        try:
+            cv2.destroyWindow(self.window_name)
+        except Exception:
+            pass
+
+    def stop(self):
+        self.stop_event.set()
+
+
+# -----------------------------------------------------------------------------
 # Node implementation
 # -----------------------------------------------------------------------------
 
@@ -141,7 +199,7 @@ class UvcNode(NodeHTTPService):
     RECOVERY_BACKOFF_BASE = 2.0
     RECOVERY_BACKOFF_MAX = 30.0
 
-    def __init__(self, gripper_id: str = None, port: int = None):
+    def __init__(self, gripper_id: str = None, port: int = None, preview: bool = False):
         self.gripper_id = gripper_id or get_default_gripper_id()
         self.shm_manager: Optional[SharedMemoryManager] = None
         self.camera: Optional[UvcCamera] = None
@@ -149,6 +207,9 @@ class UvcNode(NodeHTTPService):
         self.sidecar_stop: Optional[threading.Event] = None
         self.current_video: Optional[Path] = None
         self.current_meta: Optional[Path] = None
+        # Preview state
+        self.preview_enabled = preview
+        self.preview_thread: Optional[UvcPreviewThread] = None
         super().__init__(name=f"uvc_{self.gripper_id}", host=HTTP_CONF.UVC_HOST, port=port or HTTP_CONF.UVC_PORT)
 
     # Lifecycle ---------------------------------------------------------------
@@ -185,8 +246,11 @@ class UvcNode(NodeHTTPService):
         )
         self.camera.start(wait=True)
         logger.info("UVC camera started.")
+        if self.preview_enabled:
+            self._start_preview()
 
     def on_shutdown(self):
+        self._stop_preview()
         self._stop_sidecar()
         if self.camera:
             try:
@@ -198,6 +262,34 @@ class UvcNode(NodeHTTPService):
                 self.shm_manager.shutdown()
             except Exception:
                 pass
+
+    # Preview ----------------------------------------------------------------
+    def _start_preview(self):
+        """Start the preview thread if display is available and camera is ready."""
+        if os.environ.get("DISPLAY") is None:
+            logger.warning("[Preview] No display available, skipping preview")
+            return
+
+        # Check camera is alive and ready
+        if not self.camera or not self.camera.is_alive():
+            logger.warning("[Preview] Camera not available, skipping preview")
+            return
+
+        self._stop_preview()  # Stop any existing preview
+        self.preview_thread = UvcPreviewThread(
+            camera=self.camera,
+            gripper_id=self.gripper_id,
+            fps=PREVIEW_CONF.UVC_PREVIEW_FPS,
+        )
+        self.preview_thread.start()
+        logger.info("[Preview] UVC preview thread started")
+
+    def _stop_preview(self):
+        """Stop the preview thread."""
+        if self.preview_thread:
+            self.preview_thread.stop()
+            self.preview_thread.join(timeout=2.0)
+        self.preview_thread = None
 
     # Recovery ----------------------------------------------------------------
     def can_recover(self, exc: Exception) -> bool:
@@ -243,7 +335,10 @@ class UvcNode(NodeHTTPService):
         """
         logger.info("[Reinit] Stopping camera system...")
 
-        # 1. Stop sidecar thread
+        # 1. Stop preview thread (before camera stops)
+        self._stop_preview()
+
+        # 2. Stop sidecar thread
         self._stop_sidecar()
 
         # 2. Stop camera process (this also stops VideoRecorder)
@@ -309,6 +404,10 @@ class UvcNode(NodeHTTPService):
         # 8. Reset operational state
         self.current_video = None
         self.current_meta = None
+
+        # 9. Restart preview if enabled
+        if self.preview_enabled:
+            self._start_preview()
 
     def on_recover(self):
         """Reinitialize the entire camera system."""
@@ -526,7 +625,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gripper-id", default=None, help="Gripper ID (e.g., gp00)")
     parser.add_argument("--port", type=int, default=HTTP_CONF.UVC_PORT, help="HTTP port")
+    parser.add_argument("--preview", action="store_true", help="Enable real-time preview")
     args = parser.parse_args()
 
-    node = UvcNode(gripper_id=args.gripper_id, port=args.port)
+    node = UvcNode(gripper_id=args.gripper_id, port=args.port, preview=args.preview)
     node.start()

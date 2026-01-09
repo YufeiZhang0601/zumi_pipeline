@@ -7,6 +7,7 @@ class MotorState:
     position: float
     velocity: float
     torque: float
+    last_update_time: float = 0.0  # Timestamp of last successful data update
 
 
 class MotorDriver(ABC):

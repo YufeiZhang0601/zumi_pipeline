@@ -47,7 +47,7 @@ class MotorConfig:
     MASTER_ID: int = 0x26
     SERIAL_PORT: str = "/dev/dm_can0"
     TARGET_FREQ: float = 150.0  # Motor control loop frequency (Hz)
-    LOCK_DURATION: float = 0.5  # Lock gripper position for first N seconds (0 = no lock)
+    LOCK_DURATION: float = 0  # Lock gripper position for first N seconds (0 = no lock)
 
 
 @dataclass
@@ -87,6 +87,16 @@ def get_gripper_mapping(gripper_id: str) -> Optional[GripperMapping]:
 
 
 @dataclass
+class PreviewConfig:
+    """Real-time preview settings for motor and UVC nodes."""
+    MOTOR_PREVIEW_FPS: int = 30        # Preview update rate
+    MOTOR_DECIMATION: int = 5          # Send every N samples (150Hz/5 = 30Hz)
+    MOTOR_BUFFER_SIZE: int = 300       # Plot history (~10s at 30fps)
+    MOTOR_QUEUE_SIZE: int = 100        # IPC queue depth
+    UVC_PREVIEW_FPS: int = 30          # UVC display framerate
+
+
+@dataclass
 class UvcConfig:
     # Recommend stable path e.g. /dev/v4l/by-id/usb-icSpring_icspring_camera_20240307110322-video-index0
     DEVICE: str = "/dev/v4l/by-id/usb-DCX-250107-ZW_DECXIN-video-index0"
@@ -110,5 +120,6 @@ ZMQ_CONF = ZMQConfig()
 MOTOR_CONF = MotorConfig()
 GOPRO_CONF = GoProConfig()
 UVC_CONF = UvcConfig()
+PREVIEW_CONF = PreviewConfig()
 
 STORAGE_CONF.DATA_DIR.mkdir(exist_ok=True, parents=True)

@@ -193,6 +193,7 @@ def main(input, output, tcp_offset, tx_slam_tag,
     gripper_id_gripper_cal_map = dict()
     cam_serial_gripper_cal_map = dict()
     gripper_id_range_map = dict()
+    gripper_id_motor_scale_sign_map = dict()  # NEW: store motor_scale_sign
 
     with ExifToolHelper() as et:
         for gripper_cal_path in demos_dir.glob("gripper*/gripper_range.json"):
@@ -208,6 +209,11 @@ def main(input, output, tcp_offset, tx_slam_tag,
             max_width = gripper_range_data['max_width']
             min_width = gripper_range_data['min_width']
             gripper_id_range_map[gripper_id] = (min_width, max_width)
+
+            # NEW: read motor_scale_sign (required field)
+            if 'motor_scale_sign' not in gripper_range_data:
+                raise ValueError(f"gripper_range.json 缺少 motor_scale_sign 字段，请重新运行 calibrate_gripper_range.py: {gripper_cal_path}")
+            gripper_id_motor_scale_sign_map[gripper_id] = gripper_range_data['motor_scale_sign']
 
             gripper_cal_data = {
                 'aruco_measured_width': [min_width, max_width],
@@ -719,25 +725,36 @@ def main(input, output, tcp_offset, tx_slam_tag,
                     continue
                 tag_smooth_normalized = tag_smooth_centered / tag_smooth_range
 
-                # Resample motor_pos to tag timestamps and normalize
+                # Resample motor_pos to tag timestamps
                 motor_pos_resampled = np.interp(full_video_timestamps, motor_ts, motor_pos)
-                motor_pos_centered = motor_pos_resampled - np.mean(motor_pos_resampled)
+
+                # NEW: Apply polarity correction based on motor_scale_sign from calibration
+                # If motor_scale_sign = -1, motor position decreases when gripper opens
+                # Flip the signal to align trend with tag_width (both increase when opening)
+                motor_scale_sign = gripper_id_motor_scale_sign_map[ghi]
+                if motor_scale_sign < 0:
+                    motor_pos_for_corr = -motor_pos_resampled
+                else:
+                    motor_pos_for_corr = motor_pos_resampled
+
+                # Normalize motor (using polarity-corrected signal)
+                motor_pos_centered = motor_pos_for_corr - np.mean(motor_pos_for_corr)
                 motor_pos_range = np.percentile(np.abs(motor_pos_centered), 98)
                 if motor_pos_range < 1e-6:
                     print(f"Skipping {video_dir.name}: motor range too small ({motor_pos_range})")
                     continue
                 motor_pos_normalized = motor_pos_centered / motor_pos_range
 
-                # Cross-correlation (use abs to handle positive/negative correlation)
+                # Cross-correlation (no abs needed - signals are already trend-aligned)
                 correlation = np.correlate(tag_smooth_normalized, motor_pos_normalized, mode='full')
                 n = len(tag_smooth_normalized)
                 lags = np.arange(-(n-1), n)
-                best_lag_idx = np.argmax(np.abs(correlation))
+                best_lag_idx = np.argmax(correlation)  # CHANGED: removed abs()
                 best_lag = lags[best_lag_idx]
                 t_offset = best_lag / fps
 
                 # Check correlation strength
-                max_corr = np.abs(correlation[best_lag_idx]) / n
+                max_corr = correlation[best_lag_idx] / n  # CHANGED: removed abs()
                 if max_corr < 0.3:
                     print(f"Warning: {video_dir.name} weak correlation ({max_corr:.2f}), alignment may be unreliable")
 

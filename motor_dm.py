@@ -84,6 +84,7 @@ class DMMotorDriver(MotorDriver):
             position=float(self.motor.getPosition()),
             velocity=float(self.motor.getVelocity()),
             torque=float(self.motor.getTorque()),
+            last_update_time=self.motor.get_last_update_time(),
         )
 
     def shutdown(self):
