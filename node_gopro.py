@@ -45,22 +45,32 @@ class GoProController:
 
     def _discover_ip(self):
         logger.info("Auto-discovering GoPro...")
+        import platform
         try:
-            cmd = "ip -4 --oneline link | grep -v 'state DOWN' | grep -v LOOPBACK | grep -v 'NO-CARRIER'"
-            output = subprocess.check_output(cmd, shell=True).decode("utf-8")
-            for line in output.strip().split("\n"):
-                if "inet" not in line:
-                    try:
-                        dev = line.split(":")[1].strip()
-                        ip_out = subprocess.check_output(f"ip -4 addr show dev {dev}", shell=True).decode("utf-8")
-                    except Exception:
-                        continue
-                else:
-                    ip_out = line
+            if platform.system() == "Darwin":
+                # macOS: use ifconfig
+                ip_out = subprocess.check_output("ifconfig", shell=True).decode("utf-8")
                 match = re.search(r"inet (172\.2\d\.1\d\d)\.\d+", ip_out)
                 if match:
                     subnet = match.group(1)
                     return f"{subnet}.51"
+            else:
+                # Linux: use ip command
+                cmd = "ip -4 --oneline link | grep -v 'state DOWN' | grep -v LOOPBACK | grep -v 'NO-CARRIER'"
+                output = subprocess.check_output(cmd, shell=True).decode("utf-8")
+                for line in output.strip().split("\n"):
+                    if "inet" not in line:
+                        try:
+                            dev = line.split(":")[1].strip()
+                            ip_out = subprocess.check_output(f"ip -4 addr show dev {dev}", shell=True).decode("utf-8")
+                        except Exception:
+                            continue
+                    else:
+                        ip_out = line
+                    match = re.search(r"inet (172\.2\d\.1\d\d)\.\d+", ip_out)
+                    if match:
+                        subnet = match.group(1)
+                        return f"{subnet}.51"
         except Exception:
             pass
         return None

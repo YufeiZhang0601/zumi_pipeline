@@ -1,8 +1,11 @@
 import os
+import platform
 from enum import Enum
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Optional
+
+_IS_MAC = platform.system() == "Darwin"
 
 
 class NodeStatus(str, Enum):
@@ -45,7 +48,12 @@ class MotorConfig:
     DRIVER: str = "dm"
     SLAVE_ID: int = 0x16
     MASTER_ID: int = 0x26
-    SERIAL_PORT: str = "/dev/dm_can0"
+    # Mac: /dev/tty.usbserial-XXXX  Linux: /dev/dm_can0
+    # Override with env var ZUMI_SERIAL_PORT
+    SERIAL_PORT: str = os.environ.get(
+        "ZUMI_SERIAL_PORT",
+        "/dev/tty.usbserial-0001" if _IS_MAC else "/dev/dm_can0"
+    )
     TARGET_FREQ: float = 150.0  # Motor control loop frequency (Hz)
     LOCK_DURATION: float = 0  # Lock gripper position for first N seconds (0 = no lock)
 
@@ -98,8 +106,13 @@ class PreviewConfig:
 
 @dataclass
 class UvcConfig:
-    # Recommend stable path e.g. /dev/v4l/by-id/usb-icSpring_icspring_camera_20240307110322-video-index0
-    DEVICE: str = "/dev/v4l/by-id/usb-DCX-250107-ZW_DECXIN-video-index0"
+    # Linux: /dev/v4l/by-id/usb-XXX-video-index0
+    # Mac:   camera index as string, e.g. "0" "1" "2"
+    # Override with env var ZUMI_UVC_DEVICE
+    DEVICE: str = os.environ.get(
+        "ZUMI_UVC_DEVICE",
+        "0" if _IS_MAC else "/dev/v4l/by-id/usb-DCX-250107-ZW_DECXIN-video-index0"
+    )
     RESOLUTION: tuple = (640, 480)
     FPS: int = 60
     FOURCC: str = "MJPG"  # "MJPG" for 60fps, "YUYV" for lower fps

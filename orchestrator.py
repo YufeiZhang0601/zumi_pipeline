@@ -25,12 +25,24 @@ from validator import validate, ValidationResult
 # Sound Player
 # =============================================================================
 
-SOUNDS = {
-    "ready": "/usr/share/sounds/freedesktop/stereo/complete.oga",
-    "start": "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga",
-    "stop": "/usr/share/sounds/freedesktop/stereo/bell.oga",
-    "error": "/usr/share/sounds/freedesktop/stereo/suspend-error.oga",
-}
+import platform as _platform
+
+if _platform.system() == "Darwin":
+    SOUNDS = {
+        "ready": "/System/Library/Sounds/Glass.aiff",
+        "start": "/System/Library/Sounds/Ping.aiff",
+        "stop":  "/System/Library/Sounds/Submarine.aiff",
+        "error": "/System/Library/Sounds/Basso.aiff",
+    }
+    _SOUND_CMD = "afplay"
+else:
+    SOUNDS = {
+        "ready": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        "start": "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga",
+        "stop":  "/usr/share/sounds/freedesktop/stereo/bell.oga",
+        "error": "/usr/share/sounds/freedesktop/stereo/suspend-error.oga",
+    }
+    _SOUND_CMD = "paplay"
 
 
 class SoundPlayer:
@@ -40,7 +52,7 @@ class SoundPlayer:
 
     def play(self, sound_key):
         subprocess.Popen(
-            ["paplay", SOUNDS[sound_key]],
+            [_SOUND_CMD, SOUNDS[sound_key]],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

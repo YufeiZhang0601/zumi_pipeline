@@ -217,8 +217,13 @@ class UvcCamera(mp.Process):
         threadpool_limits(self.num_threads)
         cv2.setNumThreads(self.num_threads)
 
-        # open VideoCapture
-        cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
+        # open VideoCapture — use AVFoundation on macOS, V4L2 on Linux
+        import platform
+        if platform.system() == "Darwin":
+            dev = int(self.dev_video_path) if str(self.dev_video_path).isdigit() else self.dev_video_path
+            cap = cv2.VideoCapture(dev, cv2.CAP_AVFOUNDATION)
+        else:
+            cap = cv2.VideoCapture(self.dev_video_path, cv2.CAP_V4L2)
         if not cap.isOpened():
             print(f"[UvcCamera] Failed to open device {self.dev_video_path}", flush=True)
             return
