@@ -8,6 +8,20 @@ from typing import Dict, Optional
 _IS_MAC = platform.system() == "Darwin"
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    return float(value) if value is not None else default
+
+
+def _env_str(name: str, default: Optional[str]) -> Optional[str]:
+    return os.environ.get(name, default)
+
+
 class NodeStatus(str, Enum):
     INIT = "INIT"
     IDLE = "IDLE"
@@ -21,33 +35,33 @@ class NodeStatus(str, Enum):
 
 @dataclass
 class StorageConfig:
-    DATA_DIR: Path = Path("data")
+    DATA_DIR: Path = Path(_env_str("ZUMI_DATA_DIR", "data"))
 
 
 @dataclass
 class ZMQConfig:
-    ORCHESTRATOR_IP: str = "127.0.0.1"
-    STATUS_PORT: int = 5556
+    ORCHESTRATOR_IP: str = _env_str("ZUMI_ORCHESTRATOR_IP", "127.0.0.1")
+    STATUS_PORT: int = _env_int("ZUMI_STATUS_PORT", 5556)
 
 
 @dataclass
 class HttpNodeConfig:
-    GOPRO_URL: str = "http://127.0.0.1:8001"
-    MOTOR_URL: str = "http://127.0.0.1:8002"
-    UVC_URL: str = "http://127.0.0.1:8003"
-    GOPRO_HOST: str = "0.0.0.0"
-    GOPRO_PORT: int = 8001
-    MOTOR_HOST: str = "0.0.0.0"
-    MOTOR_PORT: int = 8002
-    UVC_HOST: str = "0.0.0.0"
-    UVC_PORT: int = 8003
+    GOPRO_URL: str = _env_str("ZUMI_GOPRO_URL", "http://127.0.0.1:8001")
+    MOTOR_URL: str = _env_str("ZUMI_MOTOR_URL", "http://127.0.0.1:8002")
+    UVC_URL: str = _env_str("ZUMI_UVC_URL", "http://127.0.0.1:8003")
+    GOPRO_HOST: str = _env_str("ZUMI_GOPRO_HOST", "0.0.0.0")
+    GOPRO_PORT: int = _env_int("ZUMI_GOPRO_PORT", 8001)
+    MOTOR_HOST: str = _env_str("ZUMI_MOTOR_HOST", "0.0.0.0")
+    MOTOR_PORT: int = _env_int("ZUMI_MOTOR_PORT", 8002)
+    UVC_HOST: str = _env_str("ZUMI_UVC_HOST", "0.0.0.0")
+    UVC_PORT: int = _env_int("ZUMI_UVC_PORT", 8003)
 
 
 @dataclass
 class MotorConfig:
     DRIVER: str = "dm"
-    SLAVE_ID: int = 0x16
-    MASTER_ID: int = 0x26
+    SLAVE_ID: int = _env_int("ZUMI_MOTOR_SLAVE_ID", 0x16)
+    MASTER_ID: int = _env_int("ZUMI_MOTOR_MASTER_ID", 0x26)
     # Mac: /dev/tty.usbserial-XXXX  Linux: /dev/dm_can0
     # Override with env var ZUMI_SERIAL_PORT
     SERIAL_PORT: str = os.environ.get(
@@ -60,8 +74,8 @@ class MotorConfig:
 
 @dataclass
 class GoProConfig:
-    SN: str = None  # Serial number (optional, for IP derivation)
-    IP: str = None  # Direct IP (optional, auto-discover if None)
+    SN: str = _env_str("ZUMI_GOPRO_SN", None)  # Serial number (optional, for IP derivation)
+    IP: str = _env_str("ZUMI_GOPRO_IP", None)  # Direct IP (optional, auto-discover if None)
 
 
 @dataclass
@@ -97,11 +111,11 @@ def get_gripper_mapping(gripper_id: str) -> Optional[GripperMapping]:
 @dataclass
 class PreviewConfig:
     """Real-time preview settings for motor and UVC nodes."""
-    MOTOR_PREVIEW_FPS: int = 30        # Preview update rate
-    MOTOR_DECIMATION: int = 5          # Send every N samples (150Hz/5 = 30Hz)
-    MOTOR_BUFFER_SIZE: int = 300       # Plot history (~10s at 30fps)
-    MOTOR_QUEUE_SIZE: int = 100        # IPC queue depth
-    UVC_PREVIEW_FPS: int = 30          # UVC display framerate
+    MOTOR_PREVIEW_FPS: int = _env_int("ZUMI_MOTOR_PREVIEW_FPS", 30)
+    MOTOR_DECIMATION: int = _env_int("ZUMI_MOTOR_DECIMATION", 5)
+    MOTOR_BUFFER_SIZE: int = _env_int("ZUMI_MOTOR_BUFFER_SIZE", 300)
+    MOTOR_QUEUE_SIZE: int = _env_int("ZUMI_MOTOR_QUEUE_SIZE", 100)
+    UVC_PREVIEW_FPS: int = _env_int("ZUMI_UVC_PREVIEW_FPS", 30)
 
 
 @dataclass
@@ -113,18 +127,23 @@ class UvcConfig:
         "ZUMI_UVC_DEVICE",
         "0" if _IS_MAC else "/dev/v4l/by-id/usb-DCX-250107-ZW_DECXIN-video-index0"
     )
-    RESOLUTION: tuple = (640, 480)
-    FPS: int = 60
-    FOURCC: str = "MJPG"  # "MJPG" for 60fps, "YUYV" for lower fps
-    EXPOSURE: float = 10.0  # Manual exposure value
-    BACKEND: str = "local"  # "local" or "remote" placeholder
+    RESOLUTION: tuple = (
+        _env_int("ZUMI_UVC_WIDTH", 640),
+        _env_int("ZUMI_UVC_HEIGHT", 480),
+    )
+    FPS: int = _env_int("ZUMI_UVC_FPS", 60)
+    FOURCC: str = _env_str("ZUMI_UVC_FOURCC", "MJPG")  # "MJPG" for 60fps, "YUYV" for lower fps
+    EXPOSURE: float = _env_float("ZUMI_UVC_EXPOSURE", 10.0)
+    BACKEND: str = _env_str("ZUMI_UVC_BACKEND", "local")
     # V4L2 capture buffer size. Some drivers limit FPS when BUFFERSIZE=1.
     # Default 4 balances latency (~66ms @ 60fps) and full frame rate.
-    CAP_BUFFER_SIZE: int = 4
+    CAP_BUFFER_SIZE: int = _env_int("ZUMI_UVC_CAP_BUFFER_SIZE", 4)
     # Frame rate regulation: when enabled, aligns output to FPS target.
     # - If actual FPS > target: downsample (skip frames)
     # - If actual FPS < target: repeat frames to fill time slots
-    PUT_RATE_REGULATE: bool = True
+    PUT_RATE_REGULATE: bool = _env_str("ZUMI_UVC_PUT_RATE_REGULATE", "true").lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 STORAGE_CONF = StorageConfig()

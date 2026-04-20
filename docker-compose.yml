@@ -1,0 +1,16 @@
+services:
+  workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zumi-pipeline:local
+    platform: ${DOCKER_PLATFORM:-linux/amd64}
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      PYTHONPATH: /workspace
+      ZUMI_DATA_DIR: /workspace/data
+    volumes:
+      - .:/workspace
+    command: bash
