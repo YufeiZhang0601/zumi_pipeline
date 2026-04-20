@@ -964,11 +964,19 @@ def handle_key(key: str, state: OrchestratorState, ctx: OrchestratorContext) -> 
 )
 def main(delay, run_id, tag, validation_mode):
     gripper_id = get_default_gripper_id()
-    clients = [
-        NodeClient(f"gopro_{gripper_id}", HTTP_CONF.GOPRO_URL),
-        NodeClient(f"motor_{gripper_id}", HTTP_CONF.MOTOR_URL),
-        NodeClient(f"uvc_{gripper_id}", HTTP_CONF.UVC_URL),
-    ]
+    _all_clients = {
+        "gopro": NodeClient(f"gopro_{gripper_id}", HTTP_CONF.GOPRO_URL),
+        "motor": NodeClient(f"motor_{gripper_id}", HTTP_CONF.MOTOR_URL),
+        "uvc":   NodeClient(f"uvc_{gripper_id}",   HTTP_CONF.UVC_URL),
+    }
+    enabled = os.environ.get("ZUMI_ENABLED_NODES", "gopro,motor,uvc")
+    enabled_keys = [k.strip().lower() for k in enabled.split(",") if k.strip()]
+    unknown = [k for k in enabled_keys if k not in _all_clients]
+    if unknown:
+        click.secho(f"Unknown nodes in ZUMI_ENABLED_NODES: {unknown}", fg="red")
+        sys.exit(1)
+    clients = [_all_clients[k] for k in enabled_keys]
+    click.echo(f"[+] Enabled nodes: {', '.join(enabled_keys)}")
     expected_names = [c.name for c in clients]
 
     zmq_ctx = zmq.Context()

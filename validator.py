@@ -159,7 +159,24 @@ def get_imu_start_time(json_path: Path) -> Optional[float]:
 
 
 ValidatorFn = Callable[[str, Optional[int]], ValidationResult]
-DEFAULT_VALIDATORS = ["node_gopro", "node_motor", "node_uvc"]
+_ALL_VALIDATORS = {
+    "gopro": "node_gopro",
+    "motor": "node_motor",
+    "uvc":   "node_uvc",
+}
+
+
+def _resolve_default_validators() -> List[str]:
+    import os
+
+    enabled = os.environ.get("ZUMI_ENABLED_NODES")
+    if not enabled:
+        return list(_ALL_VALIDATORS.values())
+    keys = [k.strip().lower() for k in enabled.split(",") if k.strip()]
+    return [_ALL_VALIDATORS[k] for k in keys if k in _ALL_VALIDATORS]
+
+
+DEFAULT_VALIDATORS = _resolve_default_validators()
 
 
 def _load_validators(modules: List[str]) -> List[Tuple[str, ValidatorFn]]:
