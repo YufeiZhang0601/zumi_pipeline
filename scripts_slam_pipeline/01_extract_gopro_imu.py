@@ -21,24 +21,29 @@ from tqdm import tqdm
 @click.command()
 @click.option('-d', '--docker_image', default="chicheng/openicc:latest")
 @click.option('-n', '--num_workers', type=int, default=None)
-@click.option('-np', '--no_docker_pull', is_flag=True, default=False, help="pull docker image from docker hub")
+@click.option('-p', '--docker_pull', is_flag=True, default=False,
+              help="Force a docker pull before running. Default skips pulling and uses local cache.")
 @click.argument('session_dir', nargs=-1)
-def main(docker_image, num_workers, no_docker_pull, session_dir):
+def main(docker_image, num_workers, docker_pull, session_dir):
     if num_workers is None:
         num_workers = multiprocessing.cpu_count()
 
-    # pull docker
-    if not no_docker_pull:
-        print(f"Pulling docker image {docker_image}")
-        cmd = [
-            'docker',
-            'pull',
-            docker_image
-        ]
-        p = subprocess.run(cmd)
+    # Check local image exists
+    inspect = subprocess.run(
+        ['docker', 'image', 'inspect', docker_image],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    has_local = inspect.returncode == 0
+
+    if docker_pull or not has_local:
+        reason = "forced by --docker_pull" if docker_pull else "image not found locally"
+        print(f"Pulling docker image {docker_image} ({reason})")
+        p = subprocess.run(['docker', 'pull', docker_image])
         if p.returncode != 0:
             print("Docker pull failed!")
             exit(1)
+    else:
+        print(f"Using local cached image {docker_image} (pass --docker_pull to refresh)")
 
     for session in session_dir:
         input_dir = pathlib.Path(os.path.expanduser(session)).joinpath('demos')
