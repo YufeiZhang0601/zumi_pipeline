@@ -190,12 +190,19 @@ def _detect_markers(img, aruco_dict, param):
 
 def _estimate_pose_single_marker(corners, marker_size_m, K):
     """
-    Estimate pose for a single marker across OpenCV ArUco API variants.
-    """
-    if hasattr(cv2.aruco, 'estimatePoseSingleMarkers'):
-        return cv2.aruco.estimatePoseSingleMarkers(
-            corners, marker_size_m, K, np.zeros((1,5)))
+    Estimate pose for a single marker via solvePnP.
 
+    We deliberately avoid cv2.aruco.estimatePoseSingleMarkers because:
+      - It is deprecated/removed in newer OpenCV.
+      - OpenCV 4.7 on Apple Silicon has a caching bug where repeated calls
+        can return the *previous* rvec/tvec instead of solving for the
+        current corners (observed as a tag's tvec being byte-identical
+        across hundreds of frames with std ~1e-16).
+
+    Assumes `corners` is already in pinhole pixel space (i.e. the caller
+    has applied fisheye undistortion with P=K) so we pass zero distortion
+    to solvePnP.
+    """
     obj_pts = np.array([
         [-marker_size_m/2,  marker_size_m/2, 0],
         [ marker_size_m/2,  marker_size_m/2, 0],
@@ -217,8 +224,10 @@ def _estimate_pose_single_marker(corners, marker_size_m, K):
     if not success:
         return None, None, None
 
-    rvecs = np.array([rvec.reshape(1, 3)], dtype=np.float64)
-    tvecs = np.array([tvec.reshape(1, 3)], dtype=np.float64)
+    # Allocate fresh arrays (don't return views) so pickling many frames
+    # actually captures per-frame values rather than aliasing one buffer.
+    rvecs = np.array([rvec.reshape(1, 3).copy()], dtype=np.float64)
+    tvecs = np.array([tvec.reshape(1, 3).copy()], dtype=np.float64)
     marker_points = np.repeat(obj_pts[None, ...], rvecs.shape[0], axis=0)
     return rvecs, tvecs, marker_points
 
@@ -247,14 +256,29 @@ def detect_localize_aruco_tags(
         
         marker_size_m = marker_size_map[this_id]
         undistorted = cv2.fisheye.undistortPoints(this_corners, K, D, P=K)
+        # cv2.fisheye.undistortPoints uses an iterative solver that diverges
+        # for points near/past the fisheye boundary, returning sentinel
+        # values around +/-1e6. Feeding those into solvePnP produces garbage
+        # (z collapses to ~0). Detect that case and fall back to pinhole PnP
+        # on the raw pixel corners - less accurate at the edges but gives
+        # a tvec of the right order of magnitude.
+        und_flat = np.asarray(undistorted).reshape(-1, 2)
+        bad_undistort = (
+            not np.all(np.isfinite(und_flat))
+            or np.max(np.abs(und_flat)) > 1e5
+        )
+        if bad_undistort:
+            pnp_corners = this_corners
+        else:
+            pnp_corners = undistorted
         rvec, tvec, markerPoints = _estimate_pose_single_marker(
-            undistorted, marker_size_m, K)
+            pnp_corners, marker_size_m, K)
         if rvec is None:
             continue
         tag_dict[this_id] = {
-            'rvec': rvec.squeeze(),
-            'tvec': tvec.squeeze(),
-            'corners': this_corners.squeeze()
+            'rvec': rvec.squeeze().copy(),
+            'tvec': tvec.squeeze().copy(),
+            'corners': np.asarray(this_corners).squeeze().copy(),
         }
     return tag_dict
 

@@ -97,35 +97,87 @@ def get_video_creation_time(file_path: Path) -> Optional[float]:
     return None
 
 
-def extract_imu(video_path: Path, json_path: Path) -> bool:
-    video_path = Path(video_path).resolve()
-    json_path = Path(json_path).resolve()
+_GPMF_PRIMARY_IMAGE = "zumi/gpmf-extract:latest"
+_GPMF_LEGACY_IMAGE = "chicheng/openicc"
 
+
+def _image_exists(image: str) -> bool:
     try:
-        docker_cmd = [
-            "docker",
-            "run",
-            "--rm",
-            "--volume",
-            f"{video_path.parent}:/data",
-            "chicheng/openicc",
+        res = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return res.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _run_gpmf_extract(video_path: Path, json_path: Path) -> bool:
+    """Extract GoPro GPMF (IMU) telemetry from an MP4.
+
+    Prefers the in-repo ``zumi/gpmf-extract:latest`` image (newer
+    ``gopro-telemetry`` that can handle Hero 13 firmware packets).
+    Falls back to ``chicheng/openicc`` when the helper image is absent.
+    """
+    use_primary = _image_exists(_GPMF_PRIMARY_IMAGE)
+    if use_primary:
+        cmd = [
+            "docker", "run", "--rm",
+            "--volume", f"{video_path.parent}:/data",
+            _GPMF_PRIMARY_IMAGE,
+            f"/data/{video_path.name}",
+            f"/data/{json_path.name}",
+        ]
+    else:
+        logger.warning(
+            "Helper image %s not built; falling back to %s. "
+            "Run `docker build -t %s docker/gpmf_extract` to enable the newer extractor.",
+            _GPMF_PRIMARY_IMAGE, _GPMF_LEGACY_IMAGE, _GPMF_PRIMARY_IMAGE,
+        )
+        cmd = [
+            "docker", "run", "--rm",
+            "--volume", f"{video_path.parent}:/data",
+            _GPMF_LEGACY_IMAGE,
             "node",
             "/OpenImuCameraCalibrator/javascript/extract_metadata_single.js",
             f"/data/{video_path.name}",
             f"/data/{json_path.name}",
         ]
 
-        subprocess.run(docker_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except subprocess.CalledProcessError:
-        logger.error("Docker extraction failed.")
-        return False
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
         logger.error("Docker not found.")
         return False
     except Exception as exc:
-        logger.error(f"Error preparing docker command: {exc}")
+        logger.error(f"Error launching docker for IMU extraction: {exc}")
         return False
+
+    if res.returncode != 0:
+        logger.error(
+            "IMU extractor exited %s. stderr: %s",
+            res.returncode, (res.stderr or "").strip()[:500],
+        )
+        return False
+
+    # chicheng/openicc swallows parser errors and exits 0. Always verify the
+    # output file was actually produced and is non-empty, otherwise downstream
+    # validators will crash with a confusing "file not found".
+    if not json_path.exists() or json_path.stat().st_size < 16:
+        logger.error(
+            "IMU extractor returned success but %s was not written. "
+            "stdout tail: %s",
+            json_path, (res.stdout or "").strip()[-500:],
+        )
+        return False
+
+    return True
+
+
+def extract_imu(video_path: Path, json_path: Path) -> bool:
+    video_path = Path(video_path).resolve()
+    json_path = Path(json_path).resolve()
+    return _run_gpmf_extract(video_path, json_path)
 
 
 def get_imu_start_time(json_path: Path) -> Optional[float]:
@@ -211,8 +263,12 @@ def validate(run_id: str, episode: Optional[int] = None) -> ValidationResult:
             logger.error(f"{name} validator crashed: {exc}")
             return ValidationResult(False, "validation_error", f"{name} error: {exc}")
 
-        if not isinstance(result, ValidationResult):
-            logger.warning(f"{name} returned unexpected result, skipping")
+        # Duck-type check: when validator.py is run as __main__, node_*.py
+        # imports `from validator import ValidationResult` which resolves to a
+        # *different* class object than the one in __main__, so a strict
+        # isinstance() check would always fail. Match by shape instead.
+        if not (hasattr(result, "success") and hasattr(result, "error")):
+            logger.warning(f"{name} returned unexpected result {type(result).__name__}, skipping")
             continue
 
         if not result.success:

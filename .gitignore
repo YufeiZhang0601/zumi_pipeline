@@ -29,7 +29,23 @@ dist/
 .DS_Store
 Thumbs.db
 
+# ---- data layout ----
+# Ignore everything under data/ by default ...
 data/*
+# ... but keep the canonical runs/ index so manifests and READMEs are
+# tracked in git while the heavy MP4/IMU payloads are distributed via
+# GitHub Releases (see scripts/datasets/pull.sh).
+!data/runs/
+data/runs/*
+!data/runs/*/
+data/runs/*/*
+!data/runs/*/README.md
+!data/runs/*/manifest.csv
+!data/runs/*/.gitkeep
+
+# data_workspace/ is derivable from data/runs/ via 00_process_videos.py
+data_workspace/
+
 *.MP4
 *.mp4
 .env
